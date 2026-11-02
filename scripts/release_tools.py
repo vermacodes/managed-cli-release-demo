@@ -24,7 +24,9 @@ MANIFEST_NAME = "release-manifest.json"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
 CONTRACT_PATH = "release/contract.json"
 SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
-SEMVER_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_IDENTIFIER = (
+    r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+)
 RELEASE_PATTERN = re.compile(
     rf"^v{SEMVER_NUMBER}\.{SEMVER_NUMBER}\.{SEMVER_NUMBER}"
     rf"(?:-{SEMVER_IDENTIFIER}(?:\.{SEMVER_IDENTIFIER})*)?$"

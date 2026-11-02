@@ -175,6 +175,7 @@ class ReleasePipelineTests(unittest.TestCase):
             "v1.2.3-..",
             "v1.2.3-.preview",
             "v1٢.2.3",
+            "v1.2.3-1٢",
             "v1.2.3-a.lock",
         ):
             with self.subTest(invalid=invalid):
