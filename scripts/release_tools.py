@@ -17,6 +17,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
+from urllib.parse import quote
 
 
 MANIFEST_NAME = "release-manifest.json"
@@ -893,24 +894,41 @@ def run_installed(install_root: Path, arguments: Iterable[str]) -> int:
 
 
 def _resolve_tag_commit(repository: str, tag: str) -> str:
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            f"repos/{repository}/commits/{tag}",
-            "--jq",
-            ".sha",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    commit = result.stdout.strip()
-    if result.returncode != 0 or not COMMIT_PATTERN.fullmatch(commit):
-        raise ReleaseError(
-            f"Cannot resolve tag {tag} to a commit: {result.stderr.strip()}"
+    def api(path: str) -> dict[str, Any]:
+        result = subprocess.run(
+            ["gh", "api", path],
+            check=False,
+            capture_output=True,
+            text=True,
         )
-    return commit
+        if result.returncode != 0:
+            raise ReleaseError(
+                f"Cannot resolve tag {tag} to a commit: {result.stderr.strip()}"
+            )
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ReleaseError("GitHub returned invalid tag metadata.") from error
+        if not isinstance(value, dict):
+            raise ReleaseError("GitHub returned invalid tag metadata.")
+        return value
+
+    reference = api(f"repos/{repository}/git/ref/tags/{quote(tag, safe='')}")
+    target = reference.get("object")
+    for _depth in range(5):
+        if not isinstance(target, dict):
+            break
+        target_type = target.get("type")
+        target_sha = target.get("sha")
+        if not isinstance(target_sha, str) or not COMMIT_PATTERN.fullmatch(target_sha):
+            break
+        if target_type == "commit":
+            return target_sha
+        if target_type != "tag":
+            break
+        annotated = api(f"repos/{repository}/git/tags/{target_sha}")
+        target = annotated.get("object")
+    raise ReleaseError(f"Tag {tag} does not resolve to a valid commit.")
 
 
 def _attestation_verification_command(

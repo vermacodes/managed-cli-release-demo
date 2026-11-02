@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ from release_tools import (  # noqa: E402
     MANIFEST_NAME,
     ReleaseError,
     _attestation_verification_command,
+    _resolve_tag_commit,
     build_release,
     canonical_json,
     install_from_dist,
@@ -193,6 +195,42 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(command.count(commit), 2)
         self.assertIn("--signer-digest", command)
         self.assertIn("--source-digest", command)
+
+    def test_tag_resolution_uses_exact_tag_ref_and_peels_annotated_tag(self) -> None:
+        tag_object = "b" * 40
+        commit = "a" * 40
+        responses = [
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"object": {"sha": tag_object, "type": "tag"}}
+                ),
+                stderr="",
+            ),
+            mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"object": {"sha": commit, "type": "commit"}}
+                ),
+                stderr="",
+            ),
+        ]
+        with mock.patch("release_tools.subprocess.run", side_effect=responses) as run:
+            self.assertEqual(
+                _resolve_tag_commit(REPOSITORY, "v1.2.3"),
+                commit,
+            )
+        first_command = run.call_args_list[0].args[0]
+        second_command = run.call_args_list[1].args[0]
+        self.assertIn(
+            f"repos/{REPOSITORY}/git/ref/tags/v1.2.3",
+            first_command,
+        )
+        self.assertIn(
+            f"repos/{REPOSITORY}/git/tags/{tag_object}",
+            second_command,
+        )
+        self.assertNotIn(f"repos/{REPOSITORY}/commits/v1.2.3", first_command)
 
     def _append_entry(
         self,
