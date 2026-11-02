@@ -1,0 +1,35 @@
+{
+  "archiveRoot": "managed-cli-demo",
+  "forbiddenPathSegments": [
+    ".git",
+    ".github",
+    "__pycache__",
+    "cases",
+    "conversations",
+    "dist",
+    "logs",
+    "node_modules",
+    "sessions",
+    "temp",
+    "tmp"
+  ],
+  "includedFiles": [
+    "LICENSE",
+    "README.md",
+    "app/managed-demo.js",
+    "app/managed-demo.ps1",
+    "app/managed-demo.sh"
+  ],
+  "maxArchiveBytes": 10485760,
+  "maxEntryBytes": 1048576,
+  "product": "managed-cli-release-demo",
+  "requiredFiles": [
+    "LICENSE",
+    "README.md",
+    "app/managed-demo.js",
+    "app/managed-demo.ps1",
+    "app/managed-demo.sh",
+    "release-info.json"
+  ],
+  "schemaVersion": 1
+}

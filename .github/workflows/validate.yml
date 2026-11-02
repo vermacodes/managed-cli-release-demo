@@ -1,0 +1,48 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build twice from the same commit
+        env:
+          VERSION: v0.0.0-ci.${{ github.run_number }}
+        run: |
+          python scripts/build_release.py \
+            --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output dist-a
+          python scripts/build_release.py \
+            --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output dist-b
+          python scripts/verify_release.py dist-a
+          python scripts/verify_release.py dist-b
+          diff --recursive --brief dist-a dist-b
+          mv dist-a dist
+
+      - name: Upload validated workflow artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: managed-cli-release-demo-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,4 @@
+dist/
+.install/
+__pycache__/
+*.py[cod]
