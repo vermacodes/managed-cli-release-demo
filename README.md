@@ -91,10 +91,14 @@ the scripts never read or persist a GitHub token.
 
 For private repositories, sign in first with `gh auth login`. Add
 `--verify-attestation` to verify the downloaded ZIP's GitHub artifact
-attestation in addition to the manifest and checksums.
+attestation in addition to the manifest and checksums. Attestation verification
+is bound to the repository's release workflow and the immutable commit resolved
+from the requested tag.
 
-The client installs under `versions/<release>`, health-checks the staged app,
-and atomically updates `current.json`. The previous version remains available:
+The client copies downloaded assets into a private staging directory before
+verification, installs under `versions/<release>`, verifies every installed
+file, health-checks the staged app, and atomically updates `current.json`. The
+previous version remains available:
 
 ```bash
 python3 scripts/release_client.py rollback \
@@ -107,8 +111,9 @@ python3 scripts/release_client.py rollback \
   Actions artifact. It never creates a GitHub Release.
 - **Build or publish release** is manual. Its `publish` input defaults to
   `false`. A publishing run uses the `public-release` environment, attests the
-  artifacts, refuses to overwrite an existing tag/release, and then creates
-  either a prerelease or stable release.
+  artifacts from the protected job, refuses to overwrite an existing release or
+  mismatched tag, and then creates either a prerelease or stable release. A
+  retry may reuse only a tag that already points to the exact workflow commit.
 
 For a real project, protect the `public-release` environment with required
 reviewers and replace this demonstration's unsigned scripts with artifacts

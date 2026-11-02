@@ -26,8 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -48,11 +46,6 @@ jobs:
             --output dist
           python scripts/verify_release.py dist
 
-      - name: Attest release assets
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-path: dist/*
-
       - name: Upload workflow artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
@@ -68,28 +61,50 @@ jobs:
     environment: public-release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
       - name: Download validated assets
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: release-${{ inputs.version }}
           path: dist
 
-      - name: Refuse to overwrite an existing release or tag
+      - name: Reverify assets and prepare immutable tag
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
+          python scripts/verify_release.py dist
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $VERSION already exists." >&2
             exit 1
           fi
-          if git ls-remote --exit-code \
-            "https://github.com/$GITHUB_REPOSITORY.git" \
-            "refs/tags/$VERSION" >/dev/null 2>&1; then
-            echo "Tag $VERSION already exists." >&2
+          existing_tag="$(
+            git ls-remote origin "refs/tags/$VERSION" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -n "$existing_tag" && "$existing_tag" != "$GITHUB_SHA" ]]; then
+            echo "Tag $VERSION points to $existing_tag, not $GITHUB_SHA." >&2
             exit 1
           fi
+          if [[ -z "$existing_tag" ]]; then
+            git tag "$VERSION" "$GITHUB_SHA"
+            git push origin "refs/tags/$VERSION"
+          fi
+
+      - name: Attest release assets from the protected publishing job
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
 
       - name: Publish GitHub Release
         env:
@@ -103,7 +118,7 @@ jobs:
           fi
           gh release create "$VERSION" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --verify-tag \
             --title "Managed CLI Release Demo $VERSION" \
             --generate-notes \
             "${flags[@]}"

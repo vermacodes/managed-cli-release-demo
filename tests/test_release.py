@@ -17,12 +17,15 @@ from release_tools import (  # noqa: E402
     CHECKSUMS_NAME,
     MANIFEST_NAME,
     ReleaseError,
+    _attestation_verification_command,
     build_release,
     canonical_json,
     install_from_dist,
     rollback_install,
+    run_installed,
     sha256_bytes,
     sha256_file,
+    validate_release,
     verify_release_dir,
 )
 
@@ -132,6 +135,64 @@ class ReleasePipelineTests(unittest.TestCase):
         )
         self.assertEqual(pointer["current"], "v0.1.0")
         self.assertEqual(pointer["previous"], "v0.2.0")
+
+    def test_installed_file_tampering_is_rejected(self) -> None:
+        install_root = self.root / "install-tamper"
+        output = self.build("v0.1.0", "install-tamper-release")
+        installed = install_from_dist(output, install_root)
+        target = installed / "app" / "managed-demo.js"
+        tampered = bytearray(target.read_bytes())
+        tampered[-2] ^= 1
+        target.write_bytes(tampered)
+        with self.assertRaisesRegex(ReleaseError, "digest mismatch"):
+            install_from_dist(output, install_root)
+
+    def test_pointer_path_escape_is_rejected(self) -> None:
+        install_root = self.root / "pointer-escape"
+        output = self.build("v0.1.0", "pointer-release")
+        install_from_dist(output, install_root)
+        (install_root / "current.json").write_text(
+            json.dumps(
+                {
+                    "current": "../../outside",
+                    "previous": None,
+                    "schemaVersion": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ReleaseError, "Release must match"):
+            run_installed(install_root, [])
+
+    def test_release_version_uses_strict_semver(self) -> None:
+        validate_release("v1.2.3")
+        validate_release("v1.2.3-preview.1")
+        for invalid in (
+            "v01.2.3",
+            "v1.02.3",
+            "v1.2.3-..",
+            "v1.2.3-.preview",
+            "v1٢.2.3",
+            "v1.2.3-a.lock",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ReleaseError):
+                    validate_release(invalid)
+
+    def test_attestation_is_bound_to_workflow_and_commit(self) -> None:
+        commit = "a" * 40
+        command = _attestation_verification_command(
+            Path("/tmp/demo.zip"),
+            REPOSITORY,
+            commit,
+        )
+        self.assertIn(
+            f"{REPOSITORY}/.github/workflows/release.yml",
+            command,
+        )
+        self.assertEqual(command.count(commit), 2)
+        self.assertIn("--signer-digest", command)
+        self.assertIn("--source-digest", command)
 
     def _append_entry(
         self,

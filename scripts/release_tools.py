@@ -22,7 +22,12 @@ from typing import Any, Iterable
 MANIFEST_NAME = "release-manifest.json"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
 CONTRACT_PATH = "release/contract.json"
-RELEASE_PATTERN = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
+SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+SEMVER_IDENTIFIER = r"(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+RELEASE_PATTERN = re.compile(
+    rf"^v{SEMVER_NUMBER}\.{SEMVER_NUMBER}\.{SEMVER_NUMBER}"
+    rf"(?:-{SEMVER_IDENTIFIER}(?:\.{SEMVER_IDENTIFIER})*)?$"
+)
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -100,10 +105,24 @@ def git_blob(repo_root: Path, commit: str, relative_path: str) -> tuple[bytes, i
 
 
 def validate_release(release: str) -> None:
-    if not RELEASE_PATTERN.fullmatch(release):
+    if (
+        len(release) > 128
+        or release.casefold().endswith(".lock")
+        or not RELEASE_PATTERN.fullmatch(release)
+    ):
         raise ReleaseError(
             "Release must match vMAJOR.MINOR.PATCH with an optional prerelease suffix."
         )
+    try:
+        ref_check = subprocess.run(
+            ["git", "check-ref-format", f"refs/tags/{release}"],
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError as error:
+        raise ReleaseError("Git is required to validate release tags.") from error
+    if ref_check.returncode != 0:
+        raise ReleaseError("Release is not a valid Git tag.")
 
 
 def validate_repo_path(path: str) -> None:
@@ -224,6 +243,51 @@ def _write_atomic(path: Path, content: bytes) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(is_junction and is_junction())
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _copy_regular_file(source: Path, destination: Path) -> None:
+    if _is_link_or_junction(source):
+        raise ReleaseError(f"Release asset must not be a link: {source.name}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        raise ReleaseError(f"Cannot open release asset {source.name}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"Release asset is not a regular file: {source.name}")
+        with os.fdopen(descriptor, "rb", closefd=False) as input_stream:
+            with destination.open("xb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        os.chmod(destination, 0o600)
+    finally:
+        os.close(descriptor)
+
+
+def _stage_release_assets(source_dir: Path, destination_dir: Path) -> None:
+    source_dir = _absolute_path(source_dir)
+    if not source_dir.is_dir() or _is_link_or_junction(source_dir):
+        raise ReleaseError("Release input must be a real directory.")
+    _copy_regular_file(source_dir / MANIFEST_NAME, destination_dir / MANIFEST_NAME)
+    manifest = _load_manifest(destination_dir / MANIFEST_NAME)
+    validate_manifest(manifest)
+    artifact_name = manifest["artifact"]["name"]
+    _copy_regular_file(source_dir / CHECKSUMS_NAME, destination_dir / CHECKSUMS_NAME)
+    _copy_regular_file(source_dir / artifact_name, destination_dir / artifact_name)
 
 
 def build_release(
@@ -614,6 +678,8 @@ def _read_pointer(install_root: Path) -> dict[str, Any] | None:
     pointer_path = install_root / "current.json"
     if not pointer_path.exists():
         return None
+    if _is_link_or_junction(pointer_path) or not pointer_path.is_file():
+        raise ReleaseError("The installation pointer must be a regular file.")
     try:
         value = json.loads(pointer_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -626,6 +692,9 @@ def _read_pointer(install_root: Path) -> dict[str, Any] | None:
         and not isinstance(value.get("previous"), str)
     ):
         raise ReleaseError("The installation pointer has an invalid schema.")
+    validate_release(value["current"])
+    if value["previous"] is not None:
+        validate_release(value["previous"])
     return value
 
 
@@ -647,7 +716,84 @@ def _write_pointer(
     )
 
 
-def _health_check(version_dir: Path) -> None:
+def _verify_installed_version(
+    version_dir: Path, expected_manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if (
+        not version_dir.is_dir()
+        or _is_link_or_junction(version_dir)
+        or _is_link_or_junction(version_dir.parent)
+    ):
+        raise ReleaseError("Installed version must be a real directory.")
+    manifest_path = version_dir / ".release-manifest.json"
+    digest_path = version_dir / ".artifact-sha256"
+    for metadata_path in (manifest_path, digest_path):
+        if (
+            not metadata_path.is_file()
+            or _is_link_or_junction(metadata_path)
+        ):
+            raise ReleaseError(
+                f"Installed metadata is missing or linked: {metadata_path.name}"
+            )
+    manifest = _load_manifest(manifest_path)
+    validate_manifest(manifest)
+    if expected_manifest is not None and manifest != expected_manifest:
+        raise ReleaseError("Installed manifest differs from the release manifest.")
+    if digest_path.read_text(encoding="ascii").strip() != manifest["artifact"]["sha256"]:
+        raise ReleaseError("Installed artifact identity does not match its manifest.")
+
+    expected_files: dict[str, dict[str, Any]] = {}
+    archive_roots: set[str] = set()
+    for record in manifest["files"]:
+        parts = validate_archive_path(record["path"])
+        archive_roots.add(parts[0])
+        relative = PurePosixPath(*parts[1:]).as_posix()
+        expected_files[relative] = record
+    if len(archive_roots) != 1:
+        raise ReleaseError("Installed manifest contains multiple archive roots.")
+
+    actual_files: set[str] = set()
+    for directory, directories, files in os.walk(version_dir, followlinks=False):
+        directory_path = Path(directory)
+        for name in directories:
+            child = directory_path / name
+            if _is_link_or_junction(child):
+                raise ReleaseError(f"Installed directory is linked: {child}")
+        for name in files:
+            child = directory_path / name
+            if _is_link_or_junction(child):
+                raise ReleaseError(f"Installed file is linked: {child}")
+            actual_files.add(child.relative_to(version_dir).as_posix())
+    allowed_files = set(expected_files) | {
+        ".artifact-sha256",
+        ".release-manifest.json",
+    }
+    if actual_files != allowed_files:
+        raise ReleaseError("Installed file set differs from the release manifest.")
+
+    version_root = version_dir.resolve()
+    for relative, record in expected_files.items():
+        target = version_dir / Path(*PurePosixPath(relative).parts)
+        resolved = target.resolve()
+        if version_root not in resolved.parents:
+            raise ReleaseError(f"Installed file escaped its version directory: {relative}")
+        if not target.is_file() or _is_link_or_junction(target):
+            raise ReleaseError(f"Installed file is missing or linked: {relative}")
+        if target.stat().st_size != record["sizeBytes"]:
+            raise ReleaseError(f"Installed file size mismatch: {relative}")
+        if sha256_file(target) != record["sha256"]:
+            raise ReleaseError(f"Installed file digest mismatch: {relative}")
+        if os.name != "nt":
+            actual_mode = stat.S_IMODE(target.stat().st_mode)
+            if f"{actual_mode:04o}" != record["mode"]:
+                raise ReleaseError(f"Installed file mode mismatch: {relative}")
+    return manifest
+
+
+def _health_check(
+    version_dir: Path, expected_manifest: dict[str, Any] | None = None
+) -> None:
+    _verify_installed_version(version_dir, expected_manifest)
     result = subprocess.run(
         ["node", str(version_dir / "app" / "managed-demo.js"), "--self-test"],
         check=False,
@@ -662,79 +808,128 @@ def _health_check(version_dir: Path) -> None:
 
 
 def install_from_dist(dist_dir: Path, install_root: Path) -> Path:
-    manifest = verify_release_dir(dist_dir)
-    install_root = install_root.resolve()
+    install_root = _absolute_path(install_root)
+    if install_root.exists() and _is_link_or_junction(install_root):
+        raise ReleaseError("Installation root must not be a link.")
+    install_root.mkdir(parents=True, exist_ok=True)
     versions_root = install_root / "versions"
+    if versions_root.exists() and _is_link_or_junction(versions_root):
+        raise ReleaseError("Versions root must not be a link.")
     versions_root.mkdir(parents=True, exist_ok=True)
-    release = manifest["release"]
-    final_dir = versions_root / release
-    digest_file = final_dir / ".artifact-sha256"
-    expected_digest = manifest["artifact"]["sha256"]
-    if final_dir.exists():
-        if (
-            not final_dir.is_dir()
-            or not digest_file.is_file()
-            or digest_file.read_text(encoding="ascii").strip() != expected_digest
-        ):
-            raise ReleaseError(
-                f"Version {release} already exists with different or unknown bytes."
-            )
-        _health_check(final_dir)
-    else:
-        staging = versions_root / f".{release}.staging-{uuid.uuid4().hex}"
-        try:
-            safe_extract(dist_dir / manifest["artifact"]["name"], staging, manifest)
-            _write_atomic(
-                staging / ".artifact-sha256",
-                (expected_digest + "\n").encode("ascii"),
-            )
-            _health_check(staging)
-            os.replace(staging, final_dir)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
+    with tempfile.TemporaryDirectory(
+        prefix=".release-assets-", dir=install_root
+    ) as private_directory:
+        private_dist = Path(private_directory)
+        _stage_release_assets(dist_dir, private_dist)
+        manifest = verify_release_dir(private_dist)
+        if os.name != "nt":
+            for asset in private_dist.iterdir():
+                os.chmod(asset, 0o400)
 
-    pointer = _read_pointer(install_root)
-    old_current = pointer["current"] if pointer else None
-    old_previous = pointer["previous"] if pointer else None
-    if old_current == release:
-        previous = old_previous
-    else:
-        previous = old_current
-    _write_pointer(install_root, release, previous)
-    return final_dir
+        release = manifest["release"]
+        final_dir = versions_root / release
+        expected_digest = manifest["artifact"]["sha256"]
+        if final_dir.exists():
+            _health_check(final_dir, manifest)
+        else:
+            staging = versions_root / f".{release}.staging-{uuid.uuid4().hex}"
+            try:
+                safe_extract(
+                    private_dist / manifest["artifact"]["name"],
+                    staging,
+                    manifest,
+                )
+                _write_atomic(
+                    staging / ".artifact-sha256",
+                    (expected_digest + "\n").encode("ascii"),
+                )
+                _write_atomic(
+                    staging / ".release-manifest.json",
+                    canonical_json(manifest),
+                )
+                _health_check(staging, manifest)
+                os.replace(staging, final_dir)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+
+        pointer = _read_pointer(install_root)
+        old_current = pointer["current"] if pointer else None
+        old_previous = pointer["previous"] if pointer else None
+        if old_current == release:
+            previous = old_previous
+        else:
+            previous = old_current
+        _write_pointer(install_root, release, previous)
+        return final_dir
 
 
 def rollback_install(install_root: Path) -> Path:
-    install_root = install_root.resolve()
+    install_root = _absolute_path(install_root)
+    if _is_link_or_junction(install_root):
+        raise ReleaseError("Installation root must not be a link.")
     pointer = _read_pointer(install_root)
     if not pointer or not pointer["previous"]:
         raise ReleaseError("No previous installed release is available.")
     current = pointer["current"]
     previous = pointer["previous"]
     previous_dir = install_root / "versions" / previous
-    if not previous_dir.is_dir():
-        raise ReleaseError(f"Previous release directory is missing: {previous}")
     _health_check(previous_dir)
     _write_pointer(install_root, previous, current)
     return previous_dir
 
 
 def run_installed(install_root: Path, arguments: Iterable[str]) -> int:
-    install_root = install_root.resolve()
+    install_root = _absolute_path(install_root)
+    if _is_link_or_junction(install_root):
+        raise ReleaseError("Installation root must not be a link.")
     pointer = _read_pointer(install_root)
     if not pointer:
         raise ReleaseError("No release is installed.")
-    script = (
-        install_root
-        / "versions"
-        / pointer["current"]
-        / "app"
-        / "managed-demo.js"
-    )
-    if not script.is_file():
-        raise ReleaseError("The active release is incomplete.")
+    version_dir = install_root / "versions" / pointer["current"]
+    _health_check(version_dir)
+    script = version_dir / "app" / "managed-demo.js"
     return subprocess.run(["node", str(script), *arguments], check=False).returncode
+
+
+def _resolve_tag_commit(repository: str, tag: str) -> str:
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/commits/{tag}",
+            "--jq",
+            ".sha",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    commit = result.stdout.strip()
+    if result.returncode != 0 or not COMMIT_PATTERN.fullmatch(commit):
+        raise ReleaseError(
+            f"Cannot resolve tag {tag} to a commit: {result.stderr.strip()}"
+        )
+    return commit
+
+
+def _attestation_verification_command(
+    artifact_path: Path, repository: str, source_commit: str
+) -> list[str]:
+    return [
+        "gh",
+        "attestation",
+        "verify",
+        str(artifact_path),
+        "--repo",
+        repository,
+        "--signer-workflow",
+        f"{repository}/.github/workflows/release.yml",
+        "--signer-digest",
+        source_commit,
+        "--source-digest",
+        source_commit,
+    ]
 
 
 def download_and_install(
@@ -771,6 +966,7 @@ def download_and_install(
         raise ReleaseError("GitHub CLI returned invalid release metadata.") from error
     if release.get("tagName") != tag or release.get("isDraft"):
         raise ReleaseError("The requested release is missing or still a draft.")
+    tag_commit = _resolve_tag_commit(repository, tag)
 
     with tempfile.TemporaryDirectory(prefix="managed-cli-download-") as directory:
         download_dir = Path(directory)
@@ -799,18 +995,18 @@ def download_and_install(
             manifest["release"] != tag
             or manifest["source"]["repository"].casefold()
             != repository.casefold()
+            or manifest["source"]["commit"] != tag_commit
         ):
             raise ReleaseError("Downloaded release identity does not match the request.")
+        if _resolve_tag_commit(repository, tag) != tag_commit:
+            raise ReleaseError("The release tag changed during download.")
         if verify_attestation:
             attestation = subprocess.run(
-                [
-                    "gh",
-                    "attestation",
-                    "verify",
-                    str(download_dir / artifact_name),
-                    "--repo",
+                _attestation_verification_command(
+                    download_dir / artifact_name,
                     repository,
-                ],
+                    tag_commit,
+                ),
                 check=False,
                 capture_output=True,
                 text=True,
