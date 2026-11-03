@@ -22,6 +22,7 @@ if (
         'preview'
     }
     $clientArguments = @(
+        '-B',
         $releaseClient,
         'startup',
         '--release-root', $releaseRoot,

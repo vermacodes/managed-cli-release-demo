@@ -83,6 +83,18 @@ class ReleasePipelineTests(unittest.TestCase):
             "managed-cli-demo/scripts/release_tools.py",
             packaged_paths,
         )
+        with zipfile.ZipFile(
+            first / manifest["artifact"]["name"],
+            "r",
+        ) as archive:
+            self.assertIn(
+                b"python3 -B",
+                archive.read("managed-cli-demo/app/managed-demo.sh"),
+            )
+            self.assertIn(
+                b"'-B'",
+                archive.read("managed-cli-demo/app/managed-demo.ps1"),
+            )
 
     def test_untracked_local_file_cannot_enter_bundle(self) -> None:
         secret = REPO_ROOT / "local-secret.txt"
