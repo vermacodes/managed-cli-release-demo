@@ -4,7 +4,6 @@ import io
 import json
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +22,7 @@ from release_tools import (  # noqa: E402
     _attestation_verification_command,
     _list_channel_releases,
     _resolve_tag_commit,
+    _snappy_decompress_raw,
     build_release,
     canonical_json,
     check_update,
@@ -214,18 +214,35 @@ class ReleasePipelineTests(unittest.TestCase):
                 with self.assertRaises(ReleaseError):
                     validate_release(invalid)
 
+    def test_snappy_bundle_decoder_enforces_bounds(self) -> None:
+        self.assertEqual(
+            _snappy_decompress_raw(b"\x03\x08abc", 10),
+            b"abc",
+        )
+        self.assertEqual(
+            _snappy_decompress_raw(b"\x06\x00a\x05\x01", 10),
+            b"aaaaaa",
+        )
+        with self.assertRaisesRegex(ReleaseError, "copy exceeds"):
+            _snappy_decompress_raw(b"\x06\x00a\x05\x00", 10)
+        with self.assertRaisesRegex(ReleaseError, "size limit"):
+            _snappy_decompress_raw(b"\x0b", 10)
+
     def test_attestation_is_bound_to_workflow_and_commit(self) -> None:
         commit = "a" * 40
         command = _attestation_verification_command(
             Path("/tmp/demo.zip"),
             REPOSITORY,
             commit,
+            Path("/tmp/demo.bundle.json"),
         )
         self.assertIn(
             f"{REPOSITORY}/.github/workflows/release.yml",
             command,
         )
         self.assertEqual(command.count(commit), 2)
+        self.assertIn("--bundle", command)
+        self.assertIn("/tmp/demo.bundle.json", command)
         self.assertIn("--signer-digest", command)
         self.assertIn("--source-digest", command)
         self.assertIn("--source-ref", command)
@@ -243,37 +260,25 @@ class ReleasePipelineTests(unittest.TestCase):
         tag_object = "b" * 40
         commit = "a" * 40
         responses = [
-            mock.Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    {"object": {"sha": tag_object, "type": "tag"}}
-                ),
-                stderr="",
-            ),
-            mock.Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    {"object": {"sha": commit, "type": "commit"}}
-                ),
-                stderr="",
-            ),
+            {"object": {"sha": tag_object, "type": "tag"}},
+            {"object": {"sha": commit, "type": "commit"}},
         ]
-        with mock.patch("release_tools.subprocess.run", side_effect=responses) as run:
+        with mock.patch(
+            "release_tools._github_api_json",
+            side_effect=responses,
+        ) as api:
             self.assertEqual(
                 _resolve_tag_commit(REPOSITORY, "v1.2.3"),
                 commit,
             )
-        first_command = run.call_args_list[0].args[0]
-        second_command = run.call_args_list[1].args[0]
-        self.assertIn(
+        self.assertEqual(
+            api.call_args_list[0].args[0],
             f"repos/{REPOSITORY}/git/ref/tags/v1.2.3",
-            first_command,
         )
-        self.assertIn(
+        self.assertEqual(
+            api.call_args_list[1].args[0],
             f"repos/{REPOSITORY}/git/tags/{tag_object}",
-            second_command,
         )
-        self.assertNotIn(f"repos/{REPOSITORY}/commits/v1.2.3", first_command)
 
     def test_semver_ordering_and_channel_selection(self) -> None:
         self.assertTrue(release_is_newer("v0.10.0", "v0.9.9"))
@@ -458,30 +463,21 @@ class ReleasePipelineTests(unittest.TestCase):
     def test_release_listing_fetches_and_flattens_all_pages(self) -> None:
         preview = self._release("v0.2.0", prerelease=True)
         stable = self._release("v0.1.0", prerelease=False)
-        real_run = subprocess.run
-        gh_response = mock.Mock(
-            returncode=0,
-            stdout=json.dumps([[preview], [stable]]),
-            stderr="",
-        )
-
-        def run(
-            arguments: list[str], *args: object, **kwargs: object
-        ) -> subprocess.CompletedProcess[str] | mock.Mock:
-            if arguments[:2] == ["gh", "api"]:
-                return gh_response
-            return real_run(arguments, *args, **kwargs)
-
-        with (
-            mock.patch("release_tools.shutil.which", return_value="/usr/bin/gh"),
-            mock.patch("release_tools.subprocess.run", side_effect=run) as execute,
-        ):
+        with mock.patch(
+            "release_tools._github_api_json",
+            side_effect=[[preview] * 100, [stable]],
+        ) as api:
             selected = _list_channel_releases(REPOSITORY, "stable")
         self.assertEqual(selected["tag"], "v0.1.0")
-        gh_command = execute.call_args_list[0].args[0]
-        self.assertIn("--paginate", gh_command)
-        self.assertIn("--slurp", gh_command)
-
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(
+            api.call_args_list[0].args[1],
+            {"per_page": 100, "page": 1},
+        )
+        self.assertEqual(
+            api.call_args_list[1].args[1],
+            {"per_page": 100, "page": 2},
+        )
 
     def test_prompted_update_decline_keeps_current_version(self) -> None:
         status = {

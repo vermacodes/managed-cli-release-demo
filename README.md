@@ -73,8 +73,9 @@ reports a development build. The packaged app reads the generated
 
 ## Download and install a published release
 
-Both wrappers call the same release client. GitHub CLI handles authentication;
-the scripts never read or persist a GitHub token.
+Both wrappers call the same release client. Public release discovery and
+downloads use GitHub's anonymous HTTPS APIs. GitHub CLI is used only to verify
+downloaded Sigstore bundles offline; no GitHub sign-in or token is required.
 
 ```bash
 ./scripts/get-release.sh \
@@ -89,10 +90,6 @@ the scripts never read or persist a GitHub token.
   -Tag v0.1.0 `
   -InstallRoot "$HOME\.managed-cli-demo"
 ```
-
-For private repositories, sign in first with `gh auth login`. Every install
-verifies all downloaded assets' attestations, manifest, and checksums against
-the release workflow, `main` source ref, and exact commit resolved from the tag.
 
 The client copies downloaded assets into a private staging directory before
 verification, installs under `versions/<release>`, verifies every installed
