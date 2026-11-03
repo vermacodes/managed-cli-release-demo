@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import stat
@@ -39,6 +40,8 @@ from release_tools import (  # noqa: E402
     verify_release_dir,
 )
 
+from release_client import prompt_update, startup  # noqa: E402
+
 
 REPOSITORY = "vermacodes/managed-cli-release-demo"
 
@@ -71,6 +74,15 @@ class ReleasePipelineTests(unittest.TestCase):
         manifest = verify_release_dir(first)
         self.assertEqual(manifest["release"], "v0.1.0")
         self.assertEqual(manifest["source"]["repository"], REPOSITORY)
+        packaged_paths = {record["path"] for record in manifest["files"]}
+        self.assertIn(
+            "managed-cli-demo/scripts/release_client.py",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/release_tools.py",
+            packaged_paths,
+        )
 
     def test_untracked_local_file_cannot_enter_bundle(self) -> None:
         secret = REPO_ROOT / "local-secret.txt"
@@ -457,6 +469,153 @@ class ReleasePipelineTests(unittest.TestCase):
         gh_command = execute.call_args_list[0].args[0]
         self.assertIn("--paginate", gh_command)
         self.assertIn("--slurp", gh_command)
+
+
+    def test_prompted_update_decline_keeps_current_version(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch("release_client.update_from_channel") as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "decline",
+                input_fn=lambda _prompt: "n",
+                output=output,
+            )
+        self.assertIsNone(path)
+        self.assertEqual(result["reason"], "declined")
+        self.assertIn("Update declined", output.getvalue())
+        update.assert_not_called()
+
+    def test_prompted_update_installs_only_after_yes(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        installed_path = self.root / "versions" / "v0.3.0"
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch(
+                "release_client.update_from_channel",
+                return_value=(status, installed_path),
+            ) as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "accept",
+                input_fn=lambda _prompt: "yes",
+                output=output,
+            )
+        self.assertEqual(result, status)
+        self.assertEqual(path, installed_path)
+        self.assertIn("Updated to v0.3.0", output.getvalue())
+        update.assert_called_once_with(
+            REPOSITORY,
+            "preview",
+            self.root / "accept",
+            expected_version="v0.3.0",
+        )
+
+    def test_prompted_update_never_updates_without_a_tty(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch("release_client.sys.stdin.isatty", return_value=False),
+            mock.patch("release_client.update_from_channel") as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "noninteractive",
+                output=output,
+            )
+        self.assertIsNone(path)
+        self.assertEqual(result["reason"], "confirmation-required")
+        self.assertIn("interactive confirmation is required", output.getvalue())
+        update.assert_not_called()
+
+    def test_reviewed_version_change_requires_another_confirmation(self) -> None:
+        install_root = self.root / "channel-change"
+        installed = self.build("v0.2.0", "channel-change-current")
+        install_from_dist(installed, install_root)
+        changed = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-03T00:00:00Z",
+            "tag": "v0.4.0",
+            "url": "https://example.invalid/v0.4.0",
+        }
+        with (
+            mock.patch(
+                "release_tools._list_channel_releases",
+                return_value=changed,
+            ),
+            mock.patch("release_tools.download_verified_release") as download,
+        ):
+            with self.assertRaisesRegex(
+                ReleaseError,
+                "changed after confirmation",
+            ):
+                update_from_channel(
+                    REPOSITORY,
+                    "preview",
+                    install_root,
+                    expected_version="v0.3.0",
+                )
+        download.assert_not_called()
+
+    def test_installed_startup_checks_then_runs_active_version(self) -> None:
+        install_root = self.root / "startup"
+        release = self.build("v0.3.0", "startup-release")
+        installed_path = install_from_dist(release, install_root)
+        no_update = {
+            "channel": "preview",
+            "currentVersion": "v0.3.0",
+            "latestVersion": "v0.3.0",
+            "reason": "up-to-date-or-newer",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": False,
+        }
+        with mock.patch(
+            "release_client.prompt_update",
+            return_value=(no_update, None),
+        ) as prompt:
+            result = startup(
+                installed_path,
+                install_root,
+                "preview",
+                ["--json"],
+            )
+        self.assertEqual(result, 0)
+        prompt.assert_called_once_with(
+            REPOSITORY,
+            "preview",
+            install_root,
+            report_current=False,
+        )
 
     @staticmethod
     def _release(

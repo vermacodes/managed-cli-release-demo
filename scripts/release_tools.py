@@ -1288,10 +1288,21 @@ def check_update(
 
 
 def update_from_channel(
-    repository: str, channel: str, install_root: Path
+    repository: str,
+    channel: str,
+    install_root: Path,
+    expected_version: str | None = None,
 ) -> tuple[dict[str, Any], Path | None]:
     with installation_update_lock(install_root):
         status = check_update(repository, channel, install_root)
+        if (
+            expected_version is not None
+            and status["updateAvailable"]
+            and status["latestVersion"] != expected_version
+        ):
+            raise ReleaseError(
+                "The update channel changed after confirmation; review it again."
+            )
         if not status["updateAvailable"]:
             return status, None
         selected_tag = status["latestVersion"]
