@@ -110,7 +110,6 @@ application data and creates a stable `managed-cli-demo` command:
 |---|---|---|
 | Windows | `%LOCALAPPDATA%\Programs\ManagedCliDemo` | `%LOCALAPPDATA%\Programs\ManagedCliDemo\bin` |
 | Linux/WSL | `${XDG_DATA_HOME:-~/.local/share}/managed-cli-demo` | `~/.local/bin` |
-| macOS | `~/Library/Application Support/ManagedCliDemo` | `~/.local/bin` |
 
 Windows:
 
@@ -118,7 +117,7 @@ Windows:
 .\scripts\Install-Command.ps1 -Channel preview
 ```
 
-Linux, WSL, or macOS:
+Linux or WSL:
 
 ```bash
 ./scripts/install-command.sh --channel preview
@@ -139,9 +138,10 @@ installation, then run from any directory:
 managed-cli-demo
 ```
 
-The same command works from PowerShell, Command Prompt, Bash, Zsh, Linux, WSL,
-and macOS. Each OS or WSL distribution has its own filesystem and PATH, so run
-the installer once in every environment where the command is needed.
+The same command works from PowerShell, Command Prompt, Windows Git Bash,
+native Linux, and WSL. Each Windows installation, Linux host, or WSL
+distribution has its own filesystem and PATH, so run the installer once in
+every environment where the command is needed.
 
 Install a specific release:
 

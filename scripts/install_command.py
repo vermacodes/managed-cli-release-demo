@@ -52,7 +52,7 @@ def platform_name(value: str | None = None) -> str:
     if candidate.startswith("win"):
         return "windows"
     if candidate == "darwin":
-        return "macos"
+        raise ReleaseError("macOS is not supported by this demo installer.")
     return "linux"
 
 
@@ -74,9 +74,6 @@ def default_layout(
         )
         root = base / "Programs" / "ManagedCliDemo"
         return InstallLayout(selected, root, root / "bin")
-    if selected == "macos":
-        root = user_home / "Library" / "Application Support" / "ManagedCliDemo"
-        return InstallLayout(selected, root, user_home / ".local" / "bin")
     data_home = env.get("XDG_DATA_HOME")
     base = Path(data_home) if data_home else user_home / ".local" / "share"
     root = base / "managed-cli-demo"
@@ -181,15 +178,30 @@ exit /b %errorlevel%
 """
 
 
+def _windows_bash_shim() -> str:
+    return """#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ps1="$script_dir/managed-cli-demo.ps1"
+if command -v cygpath >/dev/null 2>&1; then
+    ps1="$(cygpath -w "$ps1")"
+fi
+exec powershell.exe -NoLogo -NoProfile -File "$ps1" "$@"
+"""
+
+
 def create_command_shims(layout: InstallLayout) -> list[Path]:
     root = _ensure_real_directory(layout.install_root)
     bin_dir = _ensure_real_directory(layout.bin_dir)
     if layout.platform == "windows":
         ps1 = bin_dir / f"{COMMAND_NAME}.ps1"
         cmd = bin_dir / f"{COMMAND_NAME}.cmd"
+        bash = bin_dir / COMMAND_NAME
         _atomic_write(ps1, _powershell_shim(root))
         _atomic_write(cmd, _cmd_shim())
-        return [ps1, cmd]
+        _atomic_write(bash, _windows_bash_shim(), 0o755)
+        return [ps1, cmd, bash]
     shim = bin_dir / COMMAND_NAME
     _atomic_write(shim, _posix_shim(root), 0o755)
     return [shim]

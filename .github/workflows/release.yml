@@ -42,22 +42,6 @@ jobs:
         shell: pwsh
         run: ./scripts/Test-AuthenticodeValidation.ps1
 
-  macos-installer:
-    runs-on: macos-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Run release and installer tests on macOS
-        run: python -m unittest discover -s tests -v
-
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -95,7 +79,6 @@ jobs:
     needs:
       - authenticode-policy
       - build
-      - macos-installer
     runs-on: ubuntu-latest
     environment: public-release
     permissions:

@@ -51,16 +51,8 @@ class CommandInstallerTests(unittest.TestCase):
         )
         self.assertEqual(linux.bin_dir, home / ".local" / "bin")
 
-        macos = installer.default_layout(
-            platform="darwin",
-            environment={},
-            home=home,
-        )
-        self.assertEqual(
-            macos.install_root,
-            home / "Library" / "Application Support" / "ManagedCliDemo",
-        )
-        self.assertEqual(macos.bin_dir, home / ".local" / "bin")
+        with self.assertRaisesRegex(installer.ReleaseError, "macOS"):
+            installer.default_layout(platform="darwin", home=home)
 
     @unittest.skipIf(os.name == "nt", "POSIX command shim test")
     def test_posix_command_shim_runs_active_version(self) -> None:
@@ -145,7 +137,11 @@ class CommandInstallerTests(unittest.TestCase):
         shims = installer.create_command_shims(layout)
         self.assertEqual(
             {path.name for path in shims},
-            {"managed-cli-demo.ps1", "managed-cli-demo.cmd"},
+            {
+                "managed-cli-demo",
+                "managed-cli-demo.ps1",
+                "managed-cli-demo.cmd",
+            },
         )
         ps1 = (layout.bin_dir / "managed-cli-demo.ps1").read_text(
             encoding="utf-8"
@@ -157,6 +153,11 @@ class CommandInstallerTests(unittest.TestCase):
         self.assertIn("current.json", ps1)
         self.assertIn("managed-demo.ps1", ps1)
         self.assertIn("managed-cli-demo.ps1", cmd)
+        bash = (layout.bin_dir / "managed-cli-demo").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("powershell.exe", bash)
+        self.assertIn("cygpath -w", bash)
 
 
     def test_windows_path_registration_uses_user_environment(self) -> None:
