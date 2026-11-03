@@ -248,12 +248,16 @@ async function main() {
   console.log(`Installed ${path.basename(installed)} at ${installed}`);
   console.log('Command launchers:');
   for (const shim of shims) console.log(`  ${shim}`);
-  if (pathUpdate.changed) console.log(`Updated PATH via ${pathUpdate.location}.`);
-  console.log(
-    pathUpdate.changed
-      ? `Open a new terminal, then run: ${COMMAND}`
-      : `Run: ${COMMAND}`
-  );
+  if (layout.platform === 'linux') {
+    if (pathUpdate.changed) {
+      console.log(`Updated PATH via ${pathUpdate.location}.`);
+      console.log(`Open a new terminal, then run: ${COMMAND}`);
+    } else {
+      console.log(`Run: ${COMMAND}`);
+    }
+  } else if (args.updatePath) {
+    console.log(`Run a native installer wrapper to persist ${layout.binDir} in PATH.`);
+  }
   console.log(`BIN_DIR=${layout.binDir}`);
 }
 

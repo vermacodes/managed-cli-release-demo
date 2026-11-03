@@ -351,6 +351,18 @@ test('POSIX PATH persistence is idempotent', (t) => {
   assert.equal(profile.match(/# >>> managed-cli-demo PATH >>>/g).length, 1);
 });
 
+test('POSIX PATH persistence rejects a partial managed block', (t) => {
+  const home = temporaryDirectory(t);
+  fs.writeFileSync(
+    path.join(home, '.profile'),
+    '# >>> managed-cli-demo PATH >>>\n'
+  );
+  assert.throws(
+    () => installer.updatePosixPath('/example/bin', home, '/bin/bash'),
+    /PATH block is incomplete/
+  );
+});
+
 async function answerPrompt(answer, isTTY = true) {
   const input = new PassThrough();
   const output = new PassThrough();

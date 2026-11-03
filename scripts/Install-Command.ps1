@@ -114,7 +114,11 @@ try {
             )
             Write-Host "Added $effectiveBin to the user PATH."
             Write-Host 'Open a new terminal, then run: managed-cli-demo'
+        } else {
+            Write-Host 'Run: managed-cli-demo'
         }
+    } else {
+        Write-Host "PATH unchanged. Launcher: $effectiveBin\managed-cli-demo.ps1"
     }
 } finally {
     if ($temporary) {
