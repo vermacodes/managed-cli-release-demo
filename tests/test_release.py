@@ -242,7 +242,7 @@ class ReleasePipelineTests(unittest.TestCase):
         )
         self.assertEqual(command.count(commit), 2)
         self.assertIn("--bundle", command)
-        self.assertIn("/tmp/demo.bundle.json", command)
+        self.assertIn(str(Path("/tmp/demo.bundle.json")), command)
         self.assertIn("--signer-digest", command)
         self.assertIn("--source-digest", command)
         self.assertIn("--source-ref", command)
