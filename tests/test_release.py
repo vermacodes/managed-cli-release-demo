@@ -83,6 +83,18 @@ class ReleasePipelineTests(unittest.TestCase):
             "managed-cli-demo/scripts/release_tools.py",
             packaged_paths,
         )
+        self.assertIn(
+            "managed-cli-demo/scripts/install_command.py",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/install-command.sh",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/Install-Command.ps1",
+            packaged_paths,
+        )
         with zipfile.ZipFile(
             first / manifest["artifact"]["name"],
             "r",
