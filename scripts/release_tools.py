@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 
 MANIFEST_NAME = "release-manifest.json"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
+PROVENANCE_NAME = "build-provenance.jsonl"
 CONTRACT_PATH = "release/contract.json"
 SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
 SEMVER_IDENTIFIER = (
@@ -168,6 +169,10 @@ def release_asset_names(release: str) -> tuple[str, str, str]:
         MANIFEST_NAME,
         CHECKSUMS_NAME,
     )
+
+
+def published_asset_names(release: str) -> tuple[str, str, str, str]:
+    return (*release_asset_names(release), PROVENANCE_NAME)
 
 
 def validate_repo_path(path: str) -> None:
@@ -1360,7 +1365,8 @@ def download_verified_release(
         raise ReleaseError("Automatic updates require an immutable release.")
 
     tag_commit = _resolve_tag_commit(repository, tag)
-    expected_names = set(release_asset_names(tag))
+    expected_names = set(published_asset_names(tag))
+    download_names = set(release_asset_names(tag))
     assets = release.get("assets")
     if not isinstance(assets, list):
         raise ReleaseError("GitHub returned invalid release assets.")
@@ -1369,7 +1375,7 @@ def download_verified_release(
         for asset in assets
         if isinstance(asset, dict) and isinstance(asset.get("name"), str)
     }
-    if set(by_name) != expected_names:
+    if len(assets) != len(expected_names) or set(by_name) != expected_names:
         raise ReleaseError("Release assets do not match the release contract.")
 
     for asset_name in sorted(expected_names):
@@ -1382,6 +1388,8 @@ def download_verified_release(
             or not SHA256_PATTERN.fullmatch(digest_text[7:])
         ):
             raise ReleaseError(f"Release asset metadata is invalid: {asset_name}")
+        if asset_name not in download_names:
+            continue
         _download_release_asset(
             str(asset.get("browser_download_url")),
             destination / asset_name,
@@ -1482,8 +1490,8 @@ def select_channel_release(
             for asset in assets
             if isinstance(asset, dict) and isinstance(asset.get("name"), str)
         }
-        expected_assets = set(release_asset_names(tag))
-        if asset_names != expected_assets:
+        expected_assets = set(published_asset_names(tag))
+        if len(assets) != len(expected_assets) or asset_names != expected_assets:
             continue
         candidates.append(
             {

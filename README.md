@@ -1,10 +1,117 @@
 # Managed CLI Release Demo
 
-This public, synthetic project demonstrates a safe release pattern for a
-PowerShell/Bash CLI distributed through GitHub Releases. It is intentionally
-independent of any production product.
+This public, synthetic project demonstrates a secure release, installation, and
+update pattern for a PowerShell/Bash CLI distributed through GitHub Releases. It
+does not contain production product code.
 
-## What it demonstrates
+## Install the command
+
+Prerequisites:
+
+- Node.js 18 or newer
+- a current [GitHub CLI](https://cli.github.com/) with
+  `gh attestation verify`
+- PowerShell on Windows, or Bash and `curl` on Git Bash/WSL/Linux
+
+Python, administrator access, and root access are not required.
+
+### Windows PowerShell
+
+```powershell
+$installer = Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/vermacodes/managed-cli-release-demo/v0.5.0/scripts/Install-Command.ps1'
+& ([scriptblock]::Create($installer))
+```
+
+### Git Bash, WSL, or Linux
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/vermacodes/managed-cli-release-demo/v0.5.0/scripts/install-command.sh | bash
+```
+
+The bootstrap URL is pinned to the immutable installer version rather than a
+moving branch. Open a new terminal after the first installation, then run the
+command from any directory:
+
+```text
+managed-cli-demo
+```
+
+Run the installer once in each environment where the command is needed. A
+Windows installation is shared by PowerShell, Command Prompt, and Git Bash.
+Each WSL distribution has its own Linux filesystem and PATH, so it needs its own
+installation.
+
+The default channel is `preview`. To select `stable`, append
+`-Channel stable` to the PowerShell invocation or use
+`bash -s -- --channel stable` after the Bash pipe.
+
+macOS is intentionally outside this demo's tested support scope.
+
+## How the installer works
+
+The native PowerShell/Bash bootstrap downloads the two small Node.js installer
+modules from the same version-pinned source tag. The shared installer then:
+
+1. selects the newest complete, immutable release in the requested channel;
+2. anonymously downloads the ZIP, manifest, checksums, and offline provenance
+   bundle;
+3. checks GitHub's asset digests and verifies the three content assets with
+   `gh attestation verify --bundle`, bound to the exact repository, release
+   workflow, source commit, and `main` branch;
+4. validates the manifest, checksums, ZIP structure, paths, modes, sizes, and
+   every packaged file;
+5. extracts to a private staging directory, runs a health check, and activates
+   the version atomically;
+6. creates a stable `managed-cli-demo` launcher and adds its directory to the
+   per-user PATH idempotently.
+
+Install locations:
+
+| Environment | Versioned runtime | Command directory |
+|---|---|---|
+| Windows | `%LOCALAPPDATA%\Programs\ManagedCliDemo` | `%LOCALAPPDATA%\Programs\ManagedCliDemo\bin` |
+| WSL/Linux | `${XDG_DATA_HOME:-~/.local/share}/managed-cli-demo` | `~/.local/bin` |
+
+Installed versions remain side by side under `versions/<release>`, while
+`current.json` is the atomic activation pointer. Re-running the installer is
+safe and never automatically downgrades an existing installation. To verify
+and reactivate the previous installed version:
+
+```text
+managed-cli-demo --rollback
+```
+
+To install a specific preview release from a source checkout:
+
+```bash
+./scripts/install-command.sh --channel preview --tag v0.5.0
+```
+
+PowerShell supports the equivalent `-Channel preview -Tag v0.5.0` parameters.
+Custom locations are available through `--install-root` and `--bin-dir`, or
+`-InstallRoot` and `-BinDirectory`.
+
+## Secure startup updates
+
+The installed command checks its selected channel at startup:
+
+- `stable` accepts immutable published non-prereleases;
+- `preview` accepts immutable published prereleases;
+- drafts, mutable releases, malformed versions, and incomplete asset sets are
+  ignored.
+
+Versions use SemVer precedence rather than lexical ordering. If a newer version
+exists, the command displays the exact version and release URL, then asks:
+
+```text
+Install this update now? [y/N]
+```
+
+Blank, `n`, or any answer other than `y`/`yes` keeps the current version.
+Non-interactive launches never update. A failed download, verification, staging,
+or health check leaves the active version untouched.
+
+## Release pipeline
 
 ```text
 exact Git commit
@@ -13,193 +120,71 @@ exact Git commit
 explicit file allowlist
     |
     v
-deterministic ZIP + release manifest + SHA256SUMS
+deterministic ZIP + manifest + SHA256SUMS
     |
     v
-archive safety and reproducibility tests
+Linux and Windows validation
     |
     v
-GitHub Actions artifact
+protected publishing job + GitHub provenance
     |
     v
-optional GitHub Release + build provenance attestation
+draft release upload
     |
     v
-authenticated gh download
-    |
-    v
-verification -> staging -> health check -> atomic activation
+immutable publication
 ```
 
-The bundle builder reads every included file from the selected Git commit with
+The bundle builder reads included files from the exact selected Git commit with
 `git show`. Untracked files, local configuration, logs, dependency folders, and
 other workstation state cannot enter the archive accidentally.
 
-The verifier rejects:
+The manual release workflow defaults to build-only mode. Publishing requires
+the `public-release` environment, refuses to replace an existing release or a
+mismatched tag, creates a draft first, uploads the complete four-asset contract,
+and publishes only after upload succeeds.
 
-- missing or unexpected release assets;
-- checksum, size, or per-file digest mismatches;
-- absolute paths, `..`, backslashes, NULs, and drive-qualified paths;
-- duplicate or case-colliding ZIP entries;
-- symbolic links, encrypted entries, unsupported compression, and oversized
-  payloads;
-- manifest/release/source identity inconsistencies.
+The repository's immutable-release policy locks future published release assets
+and tags. It does not retroactively lock releases created before the policy was
+enabled.
 
-## Local validation
+## Developer validation
 
-Requirements: Git, Python 3.12+, Node.js, and a current GitHub CLI with
-artifact-attestation support.
+Python is used only for repository build and test tooling; it is not packaged
+or used by installation, launch, or update.
 
 ```bash
+node --test tests/node_runtime.test.js
 python3 -m unittest discover -s tests -v
 
 python3 scripts/build_release.py \
-  --version v0.1.0 \
+  --version v0.5.0 \
   --repository vermacodes/managed-cli-release-demo \
   --output dist
 
 python3 scripts/verify_release.py dist
 ```
 
-Run the app directly:
+Run the source app directly:
 
 ```bash
-./app/managed-demo.sh
+node app/managed-demo.js
 ```
 
-The source checkout has no generated release identity, so the direct command
-reports a development build. The packaged app reads the generated
-`release-info.json`.
+## Signing boundary
 
-## Download and install a published release
+GitHub's keyless OIDC/Sigstore build provenance is the release trust mechanism
+implemented by this demo. Windows CI separately validates Authenticode policy
+against a temporary copy of a trusted Microsoft-signed system binary, including
+wrong-publisher, wrong-thumbprint, unsigned, and tampered-file failures.
 
-Both wrappers call the same release client. Public release discovery and
-downloads use GitHub's anonymous HTTPS APIs. GitHub CLI is used only to verify
-downloaded Sigstore bundles offline; no GitHub sign-in or token is required.
-
-```bash
-./scripts/get-release.sh \
-  --repo vermacodes/managed-cli-release-demo \
-  --tag v0.1.0 \
-  --install-root "$HOME/.managed-cli-demo"
-```
-
-```powershell
-.\scripts\Get-Release.ps1 `
-  -Repository vermacodes/managed-cli-release-demo `
-  -Tag v0.1.0 `
-  -InstallRoot "$HOME\.managed-cli-demo"
-```
-
-The client copies downloaded assets into a private staging directory before
-verification, installs under `versions/<release>`, verifies every installed
-file, health-checks the staged app, and atomically updates `current.json`. The
-previous version remains available:
-
-```bash
-python3 scripts/release_client.py rollback \
-  --install-root "$HOME/.managed-cli-demo"
-```
-
-## Secure auto-update
-
-The updater discovers only complete releases in the selected channel:
-
-- `stable` accepts published non-prereleases;
-- `preview` accepts published prereleases;
-- mutable releases, drafts, malformed versions, and incomplete asset sets are ignored.
-
-Versions use SemVer precedence rather than lexical ordering, and the updater
-never downgrades an installed version automatically. Automatic channel updates
-therefore require GitHub's repository-level immutable release policy.
-
-Installed PowerShell and Bash launchers check for updates before starting the
-app. The demo defaults to the `preview` channel; set
-`MANAGED_CLI_UPDATE_CHANNEL=stable` to follow stable releases. When a newer
-version exists, the launcher shows the exact version and release URL, then asks
-`Install this update now? [y/N]`. Blank, `n`, or any response other than
-`y`/`yes` keeps the current version. Non-interactive launches never update.
-
-Manual update commands use the same confirmation. Passing `--yes` in Bash or
-`-Yes` in PowerShell is explicit non-interactive approval.
-
-```bash
-python3 scripts/release_client.py check-update \
-  --repo vermacodes/managed-cli-release-demo \
-  --channel preview \
-  --install-root "$HOME/.managed-cli-demo"
-
-./scripts/update-release.sh \
-  --repo vermacodes/managed-cli-release-demo \
-  --channel preview \
-  --install-root "$HOME/.managed-cli-demo"
-# Add --yes only when intentionally approving an unattended update.
-```
-
-```powershell
-.\scripts\Update-Release.ps1 `
-  -Repository vermacodes/managed-cli-release-demo `
-  -Channel preview `
-  -InstallRoot "$HOME\.managed-cli-demo"
-# Add -Yes only when intentionally approving an unattended update.
-```
-
-Automatic updates always verify all three assets' provenance attestations,
-require the exact release workflow identity, `main` source ref, and source commit resolved from the
-release tag, verify checksums and every archived file, stage privately,
-health-check, and atomically activate. A failed update leaves the current
-version untouched.
-
-Verify a release without installing it:
-
-```bash
-python3 scripts/release_client.py verify-remote \
-  --repo vermacodes/managed-cli-release-demo \
-  --tag v0.1.0
-```
-
-## Signing validation
-
-Published release assets are cryptographically signed with GitHub's keyless
-OIDC/Sigstore provenance attestations. This is the actual trust mechanism used
-by the demo release client.
-
-The Windows CI job separately exercises Authenticode policy against a temporary
-copy of a trusted Microsoft-signed Windows system binary. It proves that the validator:
-
-- accepts a valid signature from the exact expected publisher and thumbprint;
-- rejects a wrong publisher;
-- rejects a wrong thumbprint;
-- rejects an unsigned file;
-- rejects bytes modified after signing.
-
-The fixture neither signs release assets nor modifies certificate stores. A
-production implementation must use its organization's approved code-signing
-service and publisher certificate.
-
-## Workflows
-
-- **Validate** runs tests, proves reproducibility, and uploads a short-lived
-  Actions artifact. A Windows job also runs the Authenticode policy tests. It
-  never creates a GitHub Release.
-- **Build or publish release** is manual. Its `publish` input defaults to
-  `false`. A publishing run uses the `public-release` environment, attests the
-  artifacts from the protected job, refuses to overwrite an existing release or
-  mismatched tag, creates a draft, uploads every asset, and publishes only after
-  the complete set is present. A retry may reuse only a tag that already points
-  to the exact workflow commit.
-
-The draft-first flow is compatible with GitHub's repository-level immutable
-release policy. Enabling that policy locks future published release assets and
-tags; it does not retroactively lock older releases.
-
-For a real project, protect the `public-release` environment with required
-reviewers and replace this demonstration's unsigned scripts with artifacts
-signed by the organization's approved signing service.
+That fixture does not sign release assets or modify certificate stores. ESRP
+and production publisher signing are intentionally deferred; a production
+implementation must use its organization's approved signing service.
 
 ## Trust boundaries
 
-This demo proves packaging, transport integrity, provenance, signing-policy
-validation, safe extraction, and activation behavior. It does **not** provide a
-production signing identity, malware scanning, legal review, production
-authorization, or endpoint management.
+This demo proves deterministic packaging, transport integrity, provenance,
+archive safety, staged installation, atomic activation, and prompted updates.
+It does not provide production authorization, malware scanning, legal review,
+endpoint management, or a production code-signing identity.

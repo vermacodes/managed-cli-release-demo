@@ -19,8 +19,10 @@
     "app/managed-demo.js",
     "app/managed-demo.ps1",
     "app/managed-demo.sh",
-    "scripts/release_client.py",
-    "scripts/release_tools.py"
+    "scripts/Install-Command.ps1",
+    "scripts/install-command.js",
+    "scripts/install-command.sh",
+    "scripts/release-runtime.js"
   ],
   "maxArchiveBytes": 10485760,
   "maxEntryBytes": 1048576,
@@ -32,8 +34,10 @@
     "app/managed-demo.ps1",
     "app/managed-demo.sh",
     "release-info.json",
-    "scripts/release_client.py",
-    "scripts/release_tools.py"
+    "scripts/Install-Command.ps1",
+    "scripts/install-command.js",
+    "scripts/install-command.sh",
+    "scripts/release-runtime.js"
   ],
   "schemaVersion": 1
 }

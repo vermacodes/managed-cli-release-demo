@@ -35,6 +35,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Run Node runtime tests on Windows
+        run: node --test tests/node_runtime.test.js
+
       - name: Run release client tests on Windows
         run: python -m unittest discover -s tests -v
 
@@ -54,6 +57,9 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+
+      - name: Run Node runtime tests
+        run: node --test tests/node_runtime.test.js
 
       - name: Test and build
         env:
@@ -105,6 +111,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Publishing is allowed only from refs/heads/main." >&2
+            exit 1
+          fi
           python scripts/verify_release.py dist
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $VERSION already exists." >&2
@@ -124,9 +134,17 @@ jobs:
           fi
 
       - name: Sign release provenance from the protected publishing job
+        id: provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
+
+      - name: Add offline provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          cp -- "$BUNDLE_PATH" dist/build-provenance.jsonl
+          test -s dist/build-provenance.jsonl
 
       - name: Publish GitHub Release
         env:

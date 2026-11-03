@@ -28,6 +28,7 @@ from release_tools import (  # noqa: E402
     check_update,
     install_from_dist,
     installation_update_lock,
+    published_asset_names,
     release_asset_names,
     release_is_newer,
     rollback_install,
@@ -76,10 +77,26 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(manifest["source"]["repository"], REPOSITORY)
         packaged_paths = {record["path"] for record in manifest["files"]}
         self.assertIn(
-            "managed-cli-demo/scripts/release_client.py",
+            "managed-cli-demo/scripts/release-runtime.js",
             packaged_paths,
         )
         self.assertIn(
+            "managed-cli-demo/scripts/install-command.js",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/Install-Command.ps1",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/install-command.sh",
+            packaged_paths,
+        )
+        self.assertNotIn(
+            "managed-cli-demo/scripts/release_client.py",
+            packaged_paths,
+        )
+        self.assertNotIn(
             "managed-cli-demo/scripts/release_tools.py",
             packaged_paths,
         )
@@ -88,11 +105,11 @@ class ReleasePipelineTests(unittest.TestCase):
             "r",
         ) as archive:
             self.assertIn(
-                b"python3 -B",
+                b"exec node",
                 archive.read("managed-cli-demo/app/managed-demo.sh"),
             )
             self.assertIn(
-                b"'-B'",
+                b"Get-Command node",
                 archive.read("managed-cli-demo/app/managed-demo.ps1"),
             )
 
@@ -253,6 +270,15 @@ class ReleasePipelineTests(unittest.TestCase):
                 "managed-cli-demo_v1.2.3.zip",
                 "release-manifest.json",
                 "SHA256SUMS.txt",
+            },
+        )
+        self.assertEqual(
+            set(published_asset_names("v1.2.3")),
+            {
+                "managed-cli-demo_v1.2.3.zip",
+                "release-manifest.json",
+                "SHA256SUMS.txt",
+                "build-provenance.jsonl",
             },
         )
 
@@ -635,7 +661,7 @@ class ReleasePipelineTests(unittest.TestCase):
         immutable: bool = True,
     ) -> dict[str, object]:
         assets = (
-            [{"name": name} for name in release_asset_names(tag)]
+            [{"name": name} for name in published_asset_names(tag)]
             if complete
             else [{"name": f"managed-cli-demo_{tag}.zip"}]
         )
