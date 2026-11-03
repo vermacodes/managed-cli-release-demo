@@ -62,6 +62,7 @@ class CommandInstallerTests(unittest.TestCase):
         )
         self.assertEqual(macos.bin_dir, home / ".local" / "bin")
 
+    @unittest.skipIf(os.name == "nt", "POSIX command shim test")
     def test_posix_command_shim_runs_active_version(self) -> None:
         layout = installer.InstallLayout(
             "linux",
@@ -132,7 +133,8 @@ class CommandInstallerTests(unittest.TestCase):
         self.assertFalse(second.changed)
         self.assertEqual(content.count(installer.PATH_BLOCK_START), 1)
         self.assertEqual(content.count(installer.PATH_BLOCK_END), 1)
-        self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o600)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o600)
 
     def test_windows_shims_support_powershell_and_cmd(self) -> None:
         layout = installer.InstallLayout(
