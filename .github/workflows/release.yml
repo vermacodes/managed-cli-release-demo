@@ -22,6 +22,26 @@ permissions:
   contents: read
 
 jobs:
+  authenticode-policy:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run release client tests on Windows
+        run: python -m unittest discover -s tests -v
+
+      - name: Test Authenticode validation policy
+        shell: pwsh
+        run: ./scripts/Test-AuthenticodeValidation.ps1
+
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -56,7 +76,9 @@ jobs:
 
   publish:
     if: ${{ inputs.publish }}
-    needs: build
+    needs:
+      - authenticode-policy
+      - build
     runs-on: ubuntu-latest
     environment: public-release
     permissions:
@@ -78,7 +100,7 @@ jobs:
           name: release-${{ inputs.version }}
           path: dist
 
-      - name: Reverify assets and prepare immutable tag
+      - name: Reverify assets and prepare release tag
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
@@ -101,7 +123,7 @@ jobs:
             git push origin "refs/tags/$VERSION"
           fi
 
-      - name: Attest release assets from the protected publishing job
+      - name: Sign release provenance from the protected publishing job
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
@@ -116,9 +138,22 @@ jobs:
           if [[ "$PRERELEASE" == "true" ]]; then
             flags+=(--prerelease)
           fi
-          gh release create "$VERSION" dist/* \
+          cleanup_draft() {
+            gh release delete "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --yes >/dev/null 2>&1 || true
+          }
+          trap cleanup_draft ERR
+          gh release create "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --draft \
             --title "Managed CLI Release Demo $VERSION" \
             --generate-notes \
             "${flags[@]}"
+          gh release upload "$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY"
+          gh release edit "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+          trap - ERR

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,14 +20,21 @@ from release_tools import (  # noqa: E402
     MANIFEST_NAME,
     ReleaseError,
     _attestation_verification_command,
+    _list_channel_releases,
     _resolve_tag_commit,
     build_release,
     canonical_json,
+    check_update,
     install_from_dist,
+    installation_update_lock,
+    release_asset_names,
+    release_is_newer,
     rollback_install,
     run_installed,
+    select_channel_release,
     sha256_bytes,
     sha256_file,
+    update_from_channel,
     validate_release,
     verify_release_dir,
 )
@@ -196,6 +204,16 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(command.count(commit), 2)
         self.assertIn("--signer-digest", command)
         self.assertIn("--source-digest", command)
+        self.assertIn("--source-ref", command)
+        self.assertIn("refs/heads/main", command)
+        self.assertEqual(
+            set(release_asset_names("v1.2.3")),
+            {
+                "managed-cli-demo_v1.2.3.zip",
+                "release-manifest.json",
+                "SHA256SUMS.txt",
+            },
+        )
 
     def test_tag_resolution_uses_exact_tag_ref_and_peels_annotated_tag(self) -> None:
         tag_object = "b" * 40
@@ -232,6 +250,237 @@ class ReleasePipelineTests(unittest.TestCase):
             second_command,
         )
         self.assertNotIn(f"repos/{REPOSITORY}/commits/v1.2.3", first_command)
+
+    def test_semver_ordering_and_channel_selection(self) -> None:
+        self.assertTrue(release_is_newer("v0.10.0", "v0.9.9"))
+        self.assertTrue(release_is_newer("v1.0.0", "v1.0.0-preview.9"))
+        self.assertTrue(
+            release_is_newer("v1.0.0-preview.10", "v1.0.0-preview.2")
+        )
+        releases = [
+            self._release("v0.9.9", prerelease=False),
+            self._release("v0.10.0", prerelease=False),
+            self._release("v1.0.0-preview.2", prerelease=True),
+            self._release("v1.0.0-preview.10", prerelease=True),
+            self._release("v9.0.0", prerelease=False, draft=True),
+            self._release("v8.0.0", prerelease=False, complete=False),
+            self._release("v7.0.0", prerelease=False, immutable=False),
+        ]
+        self.assertEqual(
+            select_channel_release(releases, "stable")["tag"],
+            "v0.10.0",
+        )
+        self.assertEqual(
+            select_channel_release(releases, "preview")["tag"],
+            "v1.0.0-preview.10",
+        )
+
+    def test_update_check_never_downgrades(self) -> None:
+        install_root = self.root / "no-downgrade"
+        installed = self.build("v0.2.0", "installed-v020")
+        install_from_dist(installed, install_root)
+        older = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "tag": "v0.1.0",
+            "url": "https://example.invalid/v0.1.0",
+        }
+        with mock.patch(
+            "release_tools._list_channel_releases",
+            return_value=older,
+        ):
+            status = check_update(REPOSITORY, "preview", install_root)
+        self.assertFalse(status["updateAvailable"])
+        self.assertEqual(status["reason"], "up-to-date-or-newer")
+
+    def test_update_rejects_install_from_different_repository(self) -> None:
+        install_root = self.root / "wrong-repository"
+        output = self.root / "wrong-repository-release"
+        build_release(
+            repo_root=REPO_ROOT,
+            output_dir=output,
+            release="v0.1.0",
+            repository="someone-else/managed-cli-release-demo",
+        )
+        install_from_dist(output, install_root)
+        with self.assertRaisesRegex(
+            ReleaseError,
+            "different repository",
+        ):
+            check_update(
+                REPOSITORY,
+                "preview",
+                install_root,
+            )
+
+    def test_auto_update_requires_attestation_and_channel_match(self) -> None:
+        install_root = self.root / "auto-update"
+        installed = self.build("v0.1.0", "installed-v010")
+        install_from_dist(installed, install_root)
+        latest = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-02T00:00:00Z",
+            "tag": "v0.2.0",
+            "url": "https://example.invalid/v0.2.0",
+        }
+        expected_path = install_root / "versions" / "v0.2.0"
+        with (
+            mock.patch(
+                "release_tools._list_channel_releases",
+                return_value=latest,
+            ),
+            mock.patch(
+                "release_tools.download_verified_release",
+                return_value={},
+            ) as download,
+            mock.patch(
+                "release_tools.install_from_dist",
+                return_value=expected_path,
+            ) as install,
+        ):
+            status, path = update_from_channel(
+                REPOSITORY,
+                "preview",
+                install_root,
+            )
+        self.assertTrue(status["updateAvailable"])
+        self.assertEqual(path, expected_path)
+        download.assert_called_once_with(
+            repository=REPOSITORY,
+            tag="v0.2.0",
+            destination=mock.ANY,
+            verify_attestation=True,
+            expected_prerelease=True,
+        )
+        install.assert_called_once_with(mock.ANY, install_root)
+
+    def test_failed_auto_update_preserves_current_version(self) -> None:
+        install_root = self.root / "failed-auto-update"
+        installed = self.build("v0.1.0", "failed-update-current")
+        install_from_dist(installed, install_root)
+        latest = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-02T00:00:00Z",
+            "tag": "v0.2.0",
+            "url": "https://example.invalid/v0.2.0",
+        }
+        with (
+            mock.patch(
+                "release_tools._list_channel_releases",
+                return_value=latest,
+            ),
+            mock.patch(
+                "release_tools.download_verified_release",
+                side_effect=ReleaseError("signature rejected"),
+            ),
+        ):
+            with self.assertRaisesRegex(ReleaseError, "signature rejected"):
+                update_from_channel(REPOSITORY, "preview", install_root)
+        pointer = json.loads(
+            (install_root / "current.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(pointer["current"], "v0.1.0")
+        self.assertIsNone(pointer["previous"])
+
+    def test_update_lock_serializes_installation(self) -> None:
+        install_root = self.root / "locked-update"
+        with installation_update_lock(install_root):
+            with self.assertRaisesRegex(ReleaseError, "update lock"):
+                with installation_update_lock(
+                    install_root,
+                    timeout_seconds=0.05,
+                ):
+                    self.fail("A concurrent update acquired the same lock.")
+
+    def test_newer_concurrent_install_wins_during_download(self) -> None:
+        install_root = self.root / "concurrent-update"
+        first = self.build("v0.1.0", "concurrent-v010")
+        third = self.build("v0.3.0", "concurrent-v030")
+        install_from_dist(first, install_root)
+        candidate = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-02T00:00:00Z",
+            "tag": "v0.2.0",
+            "url": "https://example.invalid/v0.2.0",
+        }
+
+        def promote_newer(**_arguments: object) -> dict[str, object]:
+            install_from_dist(third, install_root)
+            return {}
+
+        with (
+            mock.patch(
+                "release_tools._list_channel_releases",
+                return_value=candidate,
+            ),
+            mock.patch(
+                "release_tools.download_verified_release",
+                side_effect=promote_newer,
+            ),
+        ):
+            status, path = update_from_channel(
+                REPOSITORY,
+                "preview",
+                install_root,
+            )
+        self.assertIsNone(path)
+        self.assertEqual(status["currentVersion"], "v0.3.0")
+        self.assertEqual(status["reason"], "superseded-during-download")
+        pointer = json.loads(
+            (install_root / "current.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(pointer["current"], "v0.3.0")
+
+    def test_release_listing_fetches_and_flattens_all_pages(self) -> None:
+        preview = self._release("v0.2.0", prerelease=True)
+        stable = self._release("v0.1.0", prerelease=False)
+        real_run = subprocess.run
+        gh_response = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([[preview], [stable]]),
+            stderr="",
+        )
+
+        def run(
+            arguments: list[str], *args: object, **kwargs: object
+        ) -> subprocess.CompletedProcess[str] | mock.Mock:
+            if arguments[:2] == ["gh", "api"]:
+                return gh_response
+            return real_run(arguments, *args, **kwargs)
+
+        with (
+            mock.patch("release_tools.shutil.which", return_value="/usr/bin/gh"),
+            mock.patch("release_tools.subprocess.run", side_effect=run) as execute,
+        ):
+            selected = _list_channel_releases(REPOSITORY, "stable")
+        self.assertEqual(selected["tag"], "v0.1.0")
+        gh_command = execute.call_args_list[0].args[0]
+        self.assertIn("--paginate", gh_command)
+        self.assertIn("--slurp", gh_command)
+
+    @staticmethod
+    def _release(
+        tag: str,
+        *,
+        prerelease: bool,
+        draft: bool = False,
+        complete: bool = True,
+        immutable: bool = True,
+    ) -> dict[str, object]:
+        assets = (
+            [{"name": name} for name in release_asset_names(tag)]
+            if complete
+            else [{"name": f"managed-cli-demo_{tag}.zip"}]
+        )
+        return {
+            "assets": assets,
+            "draft": draft,
+            "html_url": f"https://example.invalid/{tag}",
+            "immutable": immutable,
+            "prerelease": prerelease,
+            "published_at": "2026-01-01T00:00:00Z",
+            "tag_name": tag,
+        }
 
     def _append_entry(
         self,
