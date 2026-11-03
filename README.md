@@ -101,6 +101,57 @@ python3 scripts/release_client.py rollback \
   --install-root "$HOME/.managed-cli-demo"
 ```
 
+## Install as a command
+
+The cross-platform installer places the immutable versioned runtime in per-user
+application data and creates a stable `managed-cli-demo` command:
+
+| Platform | Runtime | Command directory |
+|---|---|---|
+| Windows | `%LOCALAPPDATA%\Programs\ManagedCliDemo` | `%LOCALAPPDATA%\Programs\ManagedCliDemo\bin` |
+| Linux/WSL | `${XDG_DATA_HOME:-~/.local/share}/managed-cli-demo` | `~/.local/bin` |
+| macOS | `~/Library/Application Support/ManagedCliDemo` | `~/.local/bin` |
+
+Windows:
+
+```powershell
+.\scripts\Install-Command.ps1 -Channel preview
+```
+
+Linux, WSL, or macOS:
+
+```bash
+./scripts/install-command.sh --channel preview
+```
+
+The installer:
+
+1. selects the latest immutable release in the requested channel;
+2. anonymously downloads and verifies every asset and Sigstore attestation;
+3. installs under `versions/<release>`;
+4. creates a stable PATH command that reads `current.json`;
+5. adds the command directory to the user PATH idempotently.
+
+No administrator or root access is required. Open a new terminal after the first
+installation, then run from any directory:
+
+```text
+managed-cli-demo
+```
+
+The same command works from PowerShell, Command Prompt, Bash, Zsh, Linux, WSL,
+and macOS. Each OS or WSL distribution has its own filesystem and PATH, so run
+the installer once in every environment where the command is needed.
+
+Install a specific release:
+
+```bash
+./scripts/install-command.sh --channel preview --tag v0.4.0
+```
+
+Custom locations are available through `--install-root` and `--bin-dir` (or
+`-InstallRoot` and `-BinDirectory` in PowerShell).
+
 ## Secure auto-update
 
 The updater discovers only complete releases in the selected channel:

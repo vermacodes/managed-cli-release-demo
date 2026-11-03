@@ -19,6 +19,9 @@
     "app/managed-demo.js",
     "app/managed-demo.ps1",
     "app/managed-demo.sh",
+    "scripts/Install-Command.ps1",
+    "scripts/install-command.sh",
+    "scripts/install_command.py",
     "scripts/release_client.py",
     "scripts/release_tools.py"
   ],
@@ -32,6 +35,9 @@
     "app/managed-demo.ps1",
     "app/managed-demo.sh",
     "release-info.json",
+    "scripts/Install-Command.ps1",
+    "scripts/install-command.sh",
+    "scripts/install_command.py",
     "scripts/release_client.py",
     "scripts/release_tools.py"
   ],
