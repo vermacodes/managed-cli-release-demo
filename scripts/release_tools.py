@@ -12,11 +12,13 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
 
@@ -126,6 +128,37 @@ def validate_release(release: str) -> None:
         raise ReleaseError("Git is required to validate release tags.") from error
     if ref_check.returncode != 0:
         raise ReleaseError("Release is not a valid Git tag.")
+
+
+def release_version_key(
+    release: str,
+) -> tuple[int, int, int, int, tuple[tuple[int, int | str], ...]]:
+    validate_release(release)
+    version = release[1:]
+    core, separator, prerelease = version.partition("-")
+    major, minor, patch = (int(value) for value in core.split("."))
+    if not separator:
+        return major, minor, patch, 1, ()
+    identifiers: list[tuple[int, int | str]] = []
+    for identifier in prerelease.split("."):
+        if identifier.isascii() and identifier.isdigit():
+            identifiers.append((0, int(identifier)))
+        else:
+            identifiers.append((1, identifier))
+    return major, minor, patch, 0, tuple(identifiers)
+
+
+def release_is_newer(candidate: str, current: str) -> bool:
+    return release_version_key(candidate) > release_version_key(current)
+
+
+def release_asset_names(release: str) -> tuple[str, str, str]:
+    validate_release(release)
+    return (
+        f"managed-cli-demo_{release}.zip",
+        MANIFEST_NAME,
+        CHECKSUMS_NAME,
+    )
 
 
 def validate_repo_path(path: str) -> None:
@@ -255,6 +288,71 @@ def _is_link_or_junction(path: Path) -> bool:
 
 def _absolute_path(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
+
+
+@contextmanager
+def installation_update_lock(
+    install_root: Path, timeout_seconds: float = 120
+) -> Iterator[None]:
+    if timeout_seconds < 0:
+        raise ReleaseError("Update lock timeout must not be negative.")
+    install_root = _absolute_path(install_root)
+    if install_root.exists() and _is_link_or_junction(install_root):
+        raise ReleaseError("Installation root must not be a link.")
+    install_root.mkdir(parents=True, exist_ok=True)
+    lock_path = install_root / ".update.lock"
+    if lock_path.exists() and _is_link_or_junction(lock_path):
+        raise ReleaseError("Update lock must not be a link.")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ReleaseError(f"Cannot open the update lock: {error}") from error
+    deadline = time.monotonic() + timeout_seconds
+    with os.fdopen(descriptor, "r+b") as lock_stream:
+        metadata = os.fstat(lock_stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError("Update lock must be a regular file.")
+        lock_stream.seek(0, os.SEEK_END)
+        if lock_stream.tell() == 0:
+            lock_stream.write(b"\0")
+            lock_stream.flush()
+        acquired = False
+        while not acquired:
+            try:
+                lock_stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        lock_stream.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                acquired = True
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise ReleaseError("Timed out waiting for the update lock.") from error
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            lock_stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
 
 def _copy_regular_file(source: Path, destination: Path) -> None:
@@ -949,20 +1047,30 @@ def _attestation_verification_command(
         source_commit,
         "--source-digest",
         source_commit,
+        "--source-ref",
+        "refs/heads/main",
     ]
 
 
-def download_and_install(
+def download_verified_release(
     repository: str,
     tag: str,
-    install_root: Path,
-    verify_attestation: bool = False,
-) -> Path:
+    destination: Path,
+    verify_attestation: bool = True,
+    expected_prerelease: bool | None = None,
+) -> dict[str, Any]:
     if not REPOSITORY_PATTERN.fullmatch(repository):
         raise ReleaseError("Repository must use the OWNER/REPOSITORY form.")
     validate_release(tag)
     if shutil.which("gh") is None:
         raise ReleaseError("GitHub CLI is required.")
+    destination = _absolute_path(destination)
+    if (
+        not destination.is_dir()
+        or _is_link_or_junction(destination)
+        or any(destination.iterdir())
+    ):
+        raise ReleaseError("Download destination must be an empty real directory.")
     view = subprocess.run(
         [
             "gh",
@@ -986,44 +1094,46 @@ def download_and_install(
         raise ReleaseError("GitHub CLI returned invalid release metadata.") from error
     if release.get("tagName") != tag or release.get("isDraft"):
         raise ReleaseError("The requested release is missing or still a draft.")
+    if (
+        expected_prerelease is not None
+        and release.get("isPrerelease") is not expected_prerelease
+    ):
+        raise ReleaseError("The requested release is in the wrong update channel.")
     tag_commit = _resolve_tag_commit(repository, tag)
-
-    with tempfile.TemporaryDirectory(prefix="managed-cli-download-") as directory:
-        download_dir = Path(directory)
-        artifact_name = f"managed-cli-demo_{tag}.zip"
-        command = [
-            "gh",
-            "release",
-            "download",
-            tag,
-            "--repo",
-            repository,
-            "--pattern",
-            artifact_name,
-            "--pattern",
-            MANIFEST_NAME,
-            "--pattern",
-            CHECKSUMS_NAME,
-            "--dir",
-            str(download_dir),
-        ]
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise ReleaseError(f"Release download failed: {result.stderr.strip()}")
-        manifest = verify_release_dir(download_dir)
-        if (
-            manifest["release"] != tag
-            or manifest["source"]["repository"].casefold()
-            != repository.casefold()
-            or manifest["source"]["commit"] != tag_commit
-        ):
-            raise ReleaseError("Downloaded release identity does not match the request.")
-        if _resolve_tag_commit(repository, tag) != tag_commit:
-            raise ReleaseError("The release tag changed during download.")
-        if verify_attestation:
+    artifact_name, manifest_name, checksums_name = release_asset_names(tag)
+    command = [
+        "gh",
+        "release",
+        "download",
+        tag,
+        "--repo",
+        repository,
+        "--pattern",
+        artifact_name,
+        "--pattern",
+        manifest_name,
+        "--pattern",
+        checksums_name,
+        "--dir",
+        str(destination),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ReleaseError(f"Release download failed: {result.stderr.strip()}")
+    manifest = verify_release_dir(destination)
+    if (
+        manifest["release"] != tag
+        or manifest["source"]["repository"].casefold() != repository.casefold()
+        or manifest["source"]["commit"] != tag_commit
+    ):
+        raise ReleaseError("Downloaded release identity does not match the request.")
+    if _resolve_tag_commit(repository, tag) != tag_commit:
+        raise ReleaseError("The release tag changed during download.")
+    if verify_attestation:
+        for asset_name in release_asset_names(tag):
             attestation = subprocess.run(
                 _attestation_verification_command(
-                    download_dir / artifact_name,
+                    destination / asset_name,
                     repository,
                     tag_commit,
                 ),
@@ -1033,7 +1143,188 @@ def download_and_install(
             )
             if attestation.returncode != 0:
                 raise ReleaseError(
-                    f"Artifact attestation verification failed: "
+                    f"Attestation verification failed for {asset_name}: "
                     f"{attestation.stderr.strip()}"
                 )
+    return manifest
+
+
+def download_and_install(
+    repository: str,
+    tag: str,
+    install_root: Path,
+    verify_attestation: bool = True,
+    expected_prerelease: bool | None = None,
+) -> Path:
+    with tempfile.TemporaryDirectory(prefix="managed-cli-download-") as directory:
+        download_dir = Path(directory)
+        download_verified_release(
+            repository=repository,
+            tag=tag,
+            destination=download_dir,
+            verify_attestation=verify_attestation,
+            expected_prerelease=expected_prerelease,
+        )
         return install_from_dist(download_dir, install_root)
+
+
+def select_channel_release(
+    releases: list[dict[str, Any]], channel: str
+) -> dict[str, Any] | None:
+    if channel not in ("stable", "preview"):
+        raise ReleaseError("Update channel must be stable or preview.")
+    candidates: list[dict[str, Any]] = []
+    for release in releases:
+        if (
+            not isinstance(release, dict)
+            or release.get("draft") is not False
+            or release.get("immutable") is not True
+        ):
+            continue
+        is_prerelease = release.get("prerelease") is True
+        if (channel == "preview") != is_prerelease:
+            continue
+        tag = release.get("tag_name")
+        if not isinstance(tag, str):
+            continue
+        try:
+            validate_release(tag)
+        except ReleaseError:
+            continue
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            continue
+        asset_names = {
+            asset.get("name")
+            for asset in assets
+            if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+        }
+        expected_assets = set(release_asset_names(tag))
+        if asset_names != expected_assets:
+            continue
+        candidates.append(
+            {
+                "isPrerelease": is_prerelease,
+                "publishedAt": release.get("published_at"),
+                "tag": tag,
+                "url": release.get("html_url"),
+            }
+        )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda value: release_version_key(value["tag"]))
+
+
+def _list_channel_releases(
+    repository: str, channel: str
+) -> dict[str, Any] | None:
+    if not REPOSITORY_PATTERN.fullmatch(repository):
+        raise ReleaseError("Repository must use the OWNER/REPOSITORY form.")
+    if shutil.which("gh") is None:
+        raise ReleaseError("GitHub CLI is required.")
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/releases?per_page=100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ReleaseError(f"Cannot list releases: {result.stderr.strip()}")
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("GitHub returned invalid release metadata.") from error
+    if not isinstance(pages, list) or not all(
+        isinstance(page, list) for page in pages
+    ):
+        raise ReleaseError("GitHub returned invalid release metadata.")
+    releases = [release for page in pages for release in page]
+    return select_channel_release(releases, channel)
+
+
+def check_update(
+    repository: str, channel: str, install_root: Path
+) -> dict[str, Any]:
+    install_root = _absolute_path(install_root)
+    pointer = _read_pointer(install_root) if install_root.exists() else None
+    current = pointer["current"] if pointer else None
+    if current is not None:
+        installed_manifest = _verify_installed_version(
+            install_root / "versions" / current
+        )
+        if (
+            installed_manifest["source"]["repository"].casefold()
+            != repository.casefold()
+        ):
+            raise ReleaseError("Installed release belongs to a different repository.")
+    latest = _list_channel_releases(repository, channel)
+    latest_tag = latest["tag"] if latest else None
+    update_available = bool(
+        latest_tag is not None
+        and (current is None or release_is_newer(latest_tag, current))
+    )
+    if latest_tag is None:
+        reason = "channel-empty"
+    elif current is None:
+        reason = "not-installed"
+    elif update_available:
+        reason = "newer-release"
+    else:
+        reason = "up-to-date-or-newer"
+    return {
+        "channel": channel,
+        "currentVersion": current,
+        "latestVersion": latest_tag,
+        "releaseUrl": latest["url"] if latest else None,
+        "reason": reason,
+        "updateAvailable": update_available,
+    }
+
+
+def update_from_channel(
+    repository: str, channel: str, install_root: Path
+) -> tuple[dict[str, Any], Path | None]:
+    with installation_update_lock(install_root):
+        status = check_update(repository, channel, install_root)
+        if not status["updateAvailable"]:
+            return status, None
+        selected_tag = status["latestVersion"]
+        with tempfile.TemporaryDirectory(
+            prefix="managed-cli-update-"
+        ) as directory:
+            download_dir = Path(directory)
+            download_verified_release(
+                repository=repository,
+                tag=selected_tag,
+                destination=download_dir,
+                verify_attestation=True,
+                expected_prerelease=channel == "preview",
+            )
+            install_root = _absolute_path(install_root)
+            pointer = _read_pointer(install_root)
+            active = pointer["current"] if pointer else None
+            if active is not None:
+                active_manifest = _verify_installed_version(
+                    install_root / "versions" / active
+                )
+                if (
+                    active_manifest["source"]["repository"].casefold()
+                    != repository.casefold()
+                ):
+                    raise ReleaseError("Installed release belongs to a different repository.")
+            if active is not None and not release_is_newer(selected_tag, active):
+                status = {
+                    **status,
+                    "currentVersion": active,
+                    "reason": "superseded-during-download",
+                    "updateAvailable": False,
+                }
+                return status, None
+            path = install_from_dist(download_dir, install_root)
+            return status, path
