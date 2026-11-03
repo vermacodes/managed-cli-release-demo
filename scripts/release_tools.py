@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -19,7 +20,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator
-from urllib.parse import quote
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 
 MANIFEST_NAME = "release-manifest.json"
@@ -37,6 +40,12 @@ COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
+GITHUB_API_ROOT = "https://api.github.com"
+HTTP_USER_AGENT = "managed-cli-release-demo/1"
+MAX_REMOTE_ASSET_BYTES = 25 * 1024 * 1024
+MAX_ATTESTATION_BUNDLE_BYTES = 5 * 1024 * 1024
+ATTESTATION_BUNDLE_HOST = "tmaproduction.blob.core.windows.net"
+SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
 
 
 class ReleaseError(RuntimeError):
@@ -993,22 +1002,277 @@ def run_installed(install_root: Path, arguments: Iterable[str]) -> int:
     return subprocess.run(["node", str(script), *arguments], check=False).returncode
 
 
+def _github_api_json(
+    path: str,
+    query: dict[str, str | int] | None = None,
+) -> Any:
+    url = f"{GITHUB_API_ROOT}/{path.lstrip('/')}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": HTTP_USER_AGENT,
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = response.read()
+    except HTTPError as error:
+        raise ReleaseError(
+            f"GitHub API request failed ({error.code}): {path}"
+        ) from error
+    except (OSError, URLError) as error:
+        raise ReleaseError(f"GitHub API request failed: {error}") from error
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("GitHub returned invalid JSON.") from error
+
+
+def _download_release_asset(
+    url: str,
+    destination: Path,
+    repository: str,
+    tag: str,
+    asset_name: str,
+) -> None:
+    expected_url = (
+        f"https://github.com/{repository}/releases/download/"
+        f"{quote(tag, safe='')}/{quote(asset_name, safe='')}"
+    )
+    if url != expected_url:
+        raise ReleaseError(f"Unexpected download URL for {asset_name}.")
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": HTTP_USER_AGENT,
+        },
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            final_url = urlparse(response.geturl())
+            hostname = (final_url.hostname or "").casefold()
+            if (
+                final_url.scheme != "https"
+                or not (
+                    hostname == "github.com"
+                    or hostname == "objects.githubusercontent.com"
+                    or hostname.endswith(".githubusercontent.com")
+                )
+            ):
+                raise ReleaseError(
+                    f"Download redirected to an untrusted host: {hostname}"
+                )
+            declared_size = response.headers.get("Content-Length")
+            if (
+                declared_size is not None
+                and int(declared_size) > MAX_REMOTE_ASSET_BYTES
+            ):
+                raise ReleaseError(f"Remote asset is too large: {asset_name}")
+            total = 0
+            with destination.open("xb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_REMOTE_ASSET_BYTES:
+                        raise ReleaseError(
+                            f"Remote asset exceeded its size limit: {asset_name}"
+                        )
+                    output.write(chunk)
+    except HTTPError as error:
+        destination.unlink(missing_ok=True)
+        raise ReleaseError(
+            f"Release asset download failed ({error.code}): {asset_name}"
+        ) from error
+    except (OSError, URLError, ValueError, ReleaseError):
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _read_snappy_varint(payload: bytes) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    for index, byte in enumerate(payload[:10]):
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, index + 1
+        shift += 7
+    raise ReleaseError("Snappy bundle has an invalid length prefix.")
+
+
+def _snappy_decompress_raw(payload: bytes, max_output: int) -> bytes:
+    expected_length, position = _read_snappy_varint(payload)
+    if expected_length > max_output:
+        raise ReleaseError("Snappy bundle exceeds its expanded size limit.")
+    output = bytearray()
+    while position < len(payload) and len(output) < expected_length:
+        tag = payload[position]
+        position += 1
+        kind = tag & 0x03
+        if kind == 0:
+            encoded_length = tag >> 2
+            if encoded_length < 60:
+                length = encoded_length + 1
+            else:
+                length_bytes = encoded_length - 59
+                if (
+                    length_bytes > 4
+                    or position + length_bytes > len(payload)
+                ):
+                    raise ReleaseError("Snappy literal length is invalid.")
+                length = (
+                    int.from_bytes(
+                        payload[position : position + length_bytes],
+                        "little",
+                    )
+                    + 1
+                )
+                position += length_bytes
+            end = position + length
+            if end > len(payload) or len(output) + length > expected_length:
+                raise ReleaseError("Snappy literal exceeds its bounds.")
+            output.extend(payload[position:end])
+            position = end
+            continue
+
+        if kind == 1:
+            length = 4 + ((tag >> 2) & 0x07)
+            if position >= len(payload):
+                raise ReleaseError("Snappy copy offset is missing.")
+            offset = ((tag & 0xE0) << 3) | payload[position]
+            position += 1
+        elif kind == 2:
+            length = 1 + (tag >> 2)
+            if position + 2 > len(payload):
+                raise ReleaseError("Snappy copy offset is truncated.")
+            offset = int.from_bytes(payload[position : position + 2], "little")
+            position += 2
+        else:
+            length = 1 + (tag >> 2)
+            if position + 4 > len(payload):
+                raise ReleaseError("Snappy copy offset is truncated.")
+            offset = int.from_bytes(payload[position : position + 4], "little")
+            position += 4
+        if (
+            offset <= 0
+            or offset > len(output)
+            or len(output) + length > expected_length
+        ):
+            raise ReleaseError("Snappy copy exceeds its bounds.")
+        for _index in range(length):
+            output.append(output[-offset])
+
+    if position != len(payload) or len(output) != expected_length:
+        raise ReleaseError("Snappy bundle length does not match its payload.")
+    return bytes(output)
+
+
+def _download_attestation_bundle(url: str) -> dict[str, Any]:
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != ATTESTATION_BUNDLE_HOST
+    ):
+        raise ReleaseError("Attestation bundle URL uses an untrusted host.")
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": HTTP_USER_AGENT,
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            final = urlparse(response.geturl())
+            if (
+                final.scheme != "https"
+                or (final.hostname or "").casefold()
+                != ATTESTATION_BUNDLE_HOST
+            ):
+                raise ReleaseError(
+                    "Attestation bundle redirected to an untrusted host."
+                )
+            payload = response.read(MAX_ATTESTATION_BUNDLE_BYTES + 1)
+    except HTTPError as error:
+        raise ReleaseError(
+            f"Attestation bundle download failed ({error.code})."
+        ) from error
+    except (OSError, URLError) as error:
+        raise ReleaseError(
+            f"Attestation bundle download failed: {error}"
+        ) from error
+    if len(payload) > MAX_ATTESTATION_BUNDLE_BYTES:
+        raise ReleaseError("Attestation bundle exceeded its size limit.")
+    if response.headers.get("Content-Type") == "application/x-snappy":
+        payload = _snappy_decompress_raw(
+            payload,
+            MAX_ATTESTATION_BUNDLE_BYTES,
+        )
+    try:
+        bundle = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseError("Attestation bundle is invalid JSON.") from error
+    if not isinstance(bundle, dict):
+        raise ReleaseError("Attestation bundle must be a JSON object.")
+    return bundle
+
+
+def _workflow_bundle_for_digest(
+    repository: str,
+    digest: str,
+) -> dict[str, Any]:
+    response = _github_api_json(
+        f"repos/{repository}/attestations/sha256:{digest}",
+        {
+            "per_page": 100,
+            "predicate_type": SLSA_PREDICATE,
+        },
+    )
+    attestations = response.get("attestations") if isinstance(response, dict) else None
+    if not isinstance(attestations, list):
+        raise ReleaseError("GitHub returned invalid attestation metadata.")
+    for attestation in attestations:
+        if not isinstance(attestation, dict):
+            continue
+        bundle = attestation.get("bundle")
+        if not isinstance(bundle, dict):
+            bundle_url = attestation.get("bundle_url")
+            if isinstance(bundle_url, str):
+                bundle = _download_attestation_bundle(bundle_url)
+        try:
+            encoded = bundle["dsseEnvelope"]["payload"]
+            statement = json.loads(base64.b64decode(encoded))
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            continue
+        if statement.get("predicateType") != SLSA_PREDICATE:
+            continue
+        subjects = statement.get("subject")
+        if not isinstance(subjects, list):
+            continue
+        if any(
+            isinstance(subject, dict)
+            and isinstance(subject.get("digest"), dict)
+            and subject["digest"].get("sha256") == digest
+            for subject in subjects
+        ):
+            return bundle
+    raise ReleaseError(f"No build-provenance attestation found for sha256:{digest}.")
+
+
 def _resolve_tag_commit(repository: str, tag: str) -> str:
     def api(path: str) -> dict[str, Any]:
-        result = subprocess.run(
-            ["gh", "api", path],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise ReleaseError(
-                f"Cannot resolve tag {tag} to a commit: {result.stderr.strip()}"
-            )
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise ReleaseError("GitHub returned invalid tag metadata.") from error
+        value = _github_api_json(path)
         if not isinstance(value, dict):
             raise ReleaseError("GitHub returned invalid tag metadata.")
         return value
@@ -1032,13 +1296,18 @@ def _resolve_tag_commit(repository: str, tag: str) -> str:
 
 
 def _attestation_verification_command(
-    artifact_path: Path, repository: str, source_commit: str
+    artifact_path: Path,
+    repository: str,
+    source_commit: str,
+    bundle_path: Path,
 ) -> list[str]:
     return [
         "gh",
         "attestation",
         "verify",
         str(artifact_path),
+        "--bundle",
+        str(bundle_path),
         "--repo",
         repository,
         "--signer-workflow",
@@ -1062,8 +1331,8 @@ def download_verified_release(
     if not REPOSITORY_PATTERN.fullmatch(repository):
         raise ReleaseError("Repository must use the OWNER/REPOSITORY form.")
     validate_release(tag)
-    if shutil.which("gh") is None:
-        raise ReleaseError("GitHub CLI is required.")
+    if verify_attestation and shutil.which("gh") is None:
+        raise ReleaseError("GitHub CLI is required for offline attestation verification.")
     destination = _absolute_path(destination)
     if (
         not destination.is_dir()
@@ -1071,55 +1340,58 @@ def download_verified_release(
         or any(destination.iterdir())
     ):
         raise ReleaseError("Download destination must be an empty real directory.")
-    view = subprocess.run(
-        [
-            "gh",
-            "release",
-            "view",
-            tag,
-            "--repo",
-            repository,
-            "--json",
-            "tagName,isDraft,isPrerelease",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+
+    release = _github_api_json(
+        f"repos/{repository}/releases/tags/{quote(tag, safe='')}"
     )
-    if view.returncode != 0:
-        raise ReleaseError(f"Cannot read release {tag}: {view.stderr.strip()}")
-    try:
-        release = json.loads(view.stdout)
-    except json.JSONDecodeError as error:
-        raise ReleaseError("GitHub CLI returned invalid release metadata.") from error
-    if release.get("tagName") != tag or release.get("isDraft"):
+    if not isinstance(release, dict):
+        raise ReleaseError("GitHub returned invalid release metadata.")
+    if release.get("tag_name") != tag or release.get("draft") is not False:
         raise ReleaseError("The requested release is missing or still a draft.")
     if (
         expected_prerelease is not None
-        and release.get("isPrerelease") is not expected_prerelease
+        and release.get("prerelease") is not expected_prerelease
     ):
         raise ReleaseError("The requested release is in the wrong update channel.")
+    if (
+        expected_prerelease is not None
+        and release.get("immutable") is not True
+    ):
+        raise ReleaseError("Automatic updates require an immutable release.")
+
     tag_commit = _resolve_tag_commit(repository, tag)
-    artifact_name, manifest_name, checksums_name = release_asset_names(tag)
-    command = [
-        "gh",
-        "release",
-        "download",
-        tag,
-        "--repo",
-        repository,
-        "--pattern",
-        artifact_name,
-        "--pattern",
-        manifest_name,
-        "--pattern",
-        checksums_name,
-        "--dir",
-        str(destination),
-    ]
-    result = subprocess.run(command, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise ReleaseError(f"Release download failed: {result.stderr.strip()}")
+    expected_names = set(release_asset_names(tag))
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise ReleaseError("GitHub returned invalid release assets.")
+    by_name = {
+        asset.get("name"): asset
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    }
+    if set(by_name) != expected_names:
+        raise ReleaseError("Release assets do not match the release contract.")
+
+    for asset_name in sorted(expected_names):
+        asset = by_name[asset_name]
+        digest_text = asset.get("digest")
+        if (
+            asset.get("state") != "uploaded"
+            or not isinstance(digest_text, str)
+            or not digest_text.startswith("sha256:")
+            or not SHA256_PATTERN.fullmatch(digest_text[7:])
+        ):
+            raise ReleaseError(f"Release asset metadata is invalid: {asset_name}")
+        _download_release_asset(
+            str(asset.get("browser_download_url")),
+            destination / asset_name,
+            repository,
+            tag,
+            asset_name,
+        )
+        if sha256_file(destination / asset_name) != digest_text[7:]:
+            raise ReleaseError(f"GitHub asset digest mismatch: {asset_name}")
+
     manifest = verify_release_dir(destination)
     if (
         manifest["release"] != tag
@@ -1129,23 +1401,34 @@ def download_verified_release(
         raise ReleaseError("Downloaded release identity does not match the request.")
     if _resolve_tag_commit(repository, tag) != tag_commit:
         raise ReleaseError("The release tag changed during download.")
+
     if verify_attestation:
-        for asset_name in release_asset_names(tag):
-            attestation = subprocess.run(
-                _attestation_verification_command(
-                    destination / asset_name,
-                    repository,
-                    tag_commit,
-                ),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if attestation.returncode != 0:
-                raise ReleaseError(
-                    f"Attestation verification failed for {asset_name}: "
-                    f"{attestation.stderr.strip()}"
+        with tempfile.TemporaryDirectory(
+            prefix="managed-cli-attestations-"
+        ) as bundle_directory:
+            bundle_root = Path(bundle_directory)
+            for asset_name in release_asset_names(tag):
+                artifact_path = destination / asset_name
+                digest = sha256_file(artifact_path)
+                bundle = _workflow_bundle_for_digest(repository, digest)
+                bundle_path = bundle_root / f"{asset_name}.bundle.json"
+                bundle_path.write_bytes(canonical_json(bundle))
+                attestation = subprocess.run(
+                    _attestation_verification_command(
+                        artifact_path,
+                        repository,
+                        tag_commit,
+                        bundle_path,
+                    ),
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
+                if attestation.returncode != 0:
+                    raise ReleaseError(
+                        f"Attestation verification failed for {asset_name}: "
+                        f"{attestation.stderr.strip()}"
+                    )
     return manifest
 
 
@@ -1220,31 +1503,21 @@ def _list_channel_releases(
 ) -> dict[str, Any] | None:
     if not REPOSITORY_PATTERN.fullmatch(repository):
         raise ReleaseError("Repository must use the OWNER/REPOSITORY form.")
-    if shutil.which("gh") is None:
-        raise ReleaseError("GitHub CLI is required.")
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{repository}/releases?per_page=100",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise ReleaseError(f"Cannot list releases: {result.stderr.strip()}")
-    try:
-        pages = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise ReleaseError("GitHub returned invalid release metadata.") from error
-    if not isinstance(pages, list) or not all(
-        isinstance(page, list) for page in pages
-    ):
-        raise ReleaseError("GitHub returned invalid release metadata.")
-    releases = [release for page in pages for release in page]
+    releases: list[dict[str, Any]] = []
+    for page in range(1, 101):
+        value = _github_api_json(
+            f"repos/{repository}/releases",
+            {"per_page": 100, "page": page},
+        )
+        if not isinstance(value, list):
+            raise ReleaseError("GitHub returned invalid release metadata.")
+        releases.extend(
+            release for release in value if isinstance(release, dict)
+        )
+        if len(value) < 100:
+            break
+    else:
+        raise ReleaseError("Release pagination exceeded its safety limit.")
     return select_channel_release(releases, channel)
 
 
@@ -1288,10 +1561,21 @@ def check_update(
 
 
 def update_from_channel(
-    repository: str, channel: str, install_root: Path
+    repository: str,
+    channel: str,
+    install_root: Path,
+    expected_version: str | None = None,
 ) -> tuple[dict[str, Any], Path | None]:
     with installation_update_lock(install_root):
         status = check_update(repository, channel, install_root)
+        if (
+            expected_version is not None
+            and status["updateAvailable"]
+            and status["latestVersion"] != expected_version
+        ):
+            raise ReleaseError(
+                "The update channel changed after confirmation; review it again."
+            )
         if not status["updateAvailable"]:
             return status, None
         selected_tag = status["latestVersion"]

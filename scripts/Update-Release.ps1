@@ -8,7 +8,9 @@ param(
     [string]$Channel,
 
     [Parameter(Mandatory = $true)]
-    [string]$InstallRoot
+    [string]$InstallRoot,
+
+    [switch]$Yes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +27,9 @@ $arguments = @(
     '--channel', $Channel,
     '--install-root', $InstallRoot
 )
+if ($Yes) {
+    $arguments += '--yes'
+}
 if ($python.Name -eq 'py.exe') {
     $arguments = @('-3') + $arguments
 }

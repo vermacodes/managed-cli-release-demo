@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,6 +22,7 @@ from release_tools import (  # noqa: E402
     _attestation_verification_command,
     _list_channel_releases,
     _resolve_tag_commit,
+    _snappy_decompress_raw,
     build_release,
     canonical_json,
     check_update,
@@ -38,6 +39,8 @@ from release_tools import (  # noqa: E402
     validate_release,
     verify_release_dir,
 )
+
+from release_client import prompt_update, startup  # noqa: E402
 
 
 REPOSITORY = "vermacodes/managed-cli-release-demo"
@@ -71,6 +74,27 @@ class ReleasePipelineTests(unittest.TestCase):
         manifest = verify_release_dir(first)
         self.assertEqual(manifest["release"], "v0.1.0")
         self.assertEqual(manifest["source"]["repository"], REPOSITORY)
+        packaged_paths = {record["path"] for record in manifest["files"]}
+        self.assertIn(
+            "managed-cli-demo/scripts/release_client.py",
+            packaged_paths,
+        )
+        self.assertIn(
+            "managed-cli-demo/scripts/release_tools.py",
+            packaged_paths,
+        )
+        with zipfile.ZipFile(
+            first / manifest["artifact"]["name"],
+            "r",
+        ) as archive:
+            self.assertIn(
+                b"python3 -B",
+                archive.read("managed-cli-demo/app/managed-demo.sh"),
+            )
+            self.assertIn(
+                b"'-B'",
+                archive.read("managed-cli-demo/app/managed-demo.ps1"),
+            )
 
     def test_untracked_local_file_cannot_enter_bundle(self) -> None:
         secret = REPO_ROOT / "local-secret.txt"
@@ -190,18 +214,35 @@ class ReleasePipelineTests(unittest.TestCase):
                 with self.assertRaises(ReleaseError):
                     validate_release(invalid)
 
+    def test_snappy_bundle_decoder_enforces_bounds(self) -> None:
+        self.assertEqual(
+            _snappy_decompress_raw(b"\x03\x08abc", 10),
+            b"abc",
+        )
+        self.assertEqual(
+            _snappy_decompress_raw(b"\x06\x00a\x05\x01", 10),
+            b"aaaaaa",
+        )
+        with self.assertRaisesRegex(ReleaseError, "copy exceeds"):
+            _snappy_decompress_raw(b"\x06\x00a\x05\x00", 10)
+        with self.assertRaisesRegex(ReleaseError, "size limit"):
+            _snappy_decompress_raw(b"\x0b", 10)
+
     def test_attestation_is_bound_to_workflow_and_commit(self) -> None:
         commit = "a" * 40
         command = _attestation_verification_command(
             Path("/tmp/demo.zip"),
             REPOSITORY,
             commit,
+            Path("/tmp/demo.bundle.json"),
         )
         self.assertIn(
             f"{REPOSITORY}/.github/workflows/release.yml",
             command,
         )
         self.assertEqual(command.count(commit), 2)
+        self.assertIn("--bundle", command)
+        self.assertIn(str(Path("/tmp/demo.bundle.json")), command)
         self.assertIn("--signer-digest", command)
         self.assertIn("--source-digest", command)
         self.assertIn("--source-ref", command)
@@ -219,37 +260,25 @@ class ReleasePipelineTests(unittest.TestCase):
         tag_object = "b" * 40
         commit = "a" * 40
         responses = [
-            mock.Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    {"object": {"sha": tag_object, "type": "tag"}}
-                ),
-                stderr="",
-            ),
-            mock.Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    {"object": {"sha": commit, "type": "commit"}}
-                ),
-                stderr="",
-            ),
+            {"object": {"sha": tag_object, "type": "tag"}},
+            {"object": {"sha": commit, "type": "commit"}},
         ]
-        with mock.patch("release_tools.subprocess.run", side_effect=responses) as run:
+        with mock.patch(
+            "release_tools._github_api_json",
+            side_effect=responses,
+        ) as api:
             self.assertEqual(
                 _resolve_tag_commit(REPOSITORY, "v1.2.3"),
                 commit,
             )
-        first_command = run.call_args_list[0].args[0]
-        second_command = run.call_args_list[1].args[0]
-        self.assertIn(
+        self.assertEqual(
+            api.call_args_list[0].args[0],
             f"repos/{REPOSITORY}/git/ref/tags/v1.2.3",
-            first_command,
         )
-        self.assertIn(
+        self.assertEqual(
+            api.call_args_list[1].args[0],
             f"repos/{REPOSITORY}/git/tags/{tag_object}",
-            second_command,
         )
-        self.assertNotIn(f"repos/{REPOSITORY}/commits/v1.2.3", first_command)
 
     def test_semver_ordering_and_channel_selection(self) -> None:
         self.assertTrue(release_is_newer("v0.10.0", "v0.9.9"))
@@ -434,29 +463,167 @@ class ReleasePipelineTests(unittest.TestCase):
     def test_release_listing_fetches_and_flattens_all_pages(self) -> None:
         preview = self._release("v0.2.0", prerelease=True)
         stable = self._release("v0.1.0", prerelease=False)
-        real_run = subprocess.run
-        gh_response = mock.Mock(
-            returncode=0,
-            stdout=json.dumps([[preview], [stable]]),
-            stderr="",
-        )
-
-        def run(
-            arguments: list[str], *args: object, **kwargs: object
-        ) -> subprocess.CompletedProcess[str] | mock.Mock:
-            if arguments[:2] == ["gh", "api"]:
-                return gh_response
-            return real_run(arguments, *args, **kwargs)
-
-        with (
-            mock.patch("release_tools.shutil.which", return_value="/usr/bin/gh"),
-            mock.patch("release_tools.subprocess.run", side_effect=run) as execute,
-        ):
+        with mock.patch(
+            "release_tools._github_api_json",
+            side_effect=[[preview] * 100, [stable]],
+        ) as api:
             selected = _list_channel_releases(REPOSITORY, "stable")
         self.assertEqual(selected["tag"], "v0.1.0")
-        gh_command = execute.call_args_list[0].args[0]
-        self.assertIn("--paginate", gh_command)
-        self.assertIn("--slurp", gh_command)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(
+            api.call_args_list[0].args[1],
+            {"per_page": 100, "page": 1},
+        )
+        self.assertEqual(
+            api.call_args_list[1].args[1],
+            {"per_page": 100, "page": 2},
+        )
+
+    def test_prompted_update_decline_keeps_current_version(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch("release_client.update_from_channel") as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "decline",
+                input_fn=lambda _prompt: "n",
+                output=output,
+            )
+        self.assertIsNone(path)
+        self.assertEqual(result["reason"], "declined")
+        self.assertIn("Update declined", output.getvalue())
+        update.assert_not_called()
+
+    def test_prompted_update_installs_only_after_yes(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        installed_path = self.root / "versions" / "v0.3.0"
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch(
+                "release_client.update_from_channel",
+                return_value=(status, installed_path),
+            ) as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "accept",
+                input_fn=lambda _prompt: "yes",
+                output=output,
+            )
+        self.assertEqual(result, status)
+        self.assertEqual(path, installed_path)
+        self.assertIn("Updated to v0.3.0", output.getvalue())
+        update.assert_called_once_with(
+            REPOSITORY,
+            "preview",
+            self.root / "accept",
+            expected_version="v0.3.0",
+        )
+
+    def test_prompted_update_never_updates_without_a_tty(self) -> None:
+        status = {
+            "channel": "preview",
+            "currentVersion": "v0.2.0",
+            "latestVersion": "v0.3.0",
+            "reason": "newer-release",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": True,
+        }
+        output = io.StringIO()
+        with (
+            mock.patch("release_client.check_update", return_value=status),
+            mock.patch("release_client.sys.stdin.isatty", return_value=False),
+            mock.patch("release_client.update_from_channel") as update,
+        ):
+            result, path = prompt_update(
+                REPOSITORY,
+                "preview",
+                self.root / "noninteractive",
+                output=output,
+            )
+        self.assertIsNone(path)
+        self.assertEqual(result["reason"], "confirmation-required")
+        self.assertIn("interactive confirmation is required", output.getvalue())
+        update.assert_not_called()
+
+    def test_reviewed_version_change_requires_another_confirmation(self) -> None:
+        install_root = self.root / "channel-change"
+        installed = self.build("v0.2.0", "channel-change-current")
+        install_from_dist(installed, install_root)
+        changed = {
+            "isPrerelease": True,
+            "publishedAt": "2026-01-03T00:00:00Z",
+            "tag": "v0.4.0",
+            "url": "https://example.invalid/v0.4.0",
+        }
+        with (
+            mock.patch(
+                "release_tools._list_channel_releases",
+                return_value=changed,
+            ),
+            mock.patch("release_tools.download_verified_release") as download,
+        ):
+            with self.assertRaisesRegex(
+                ReleaseError,
+                "changed after confirmation",
+            ):
+                update_from_channel(
+                    REPOSITORY,
+                    "preview",
+                    install_root,
+                    expected_version="v0.3.0",
+                )
+        download.assert_not_called()
+
+    def test_installed_startup_checks_then_runs_active_version(self) -> None:
+        install_root = self.root / "startup"
+        release = self.build("v0.3.0", "startup-release")
+        installed_path = install_from_dist(release, install_root)
+        no_update = {
+            "channel": "preview",
+            "currentVersion": "v0.3.0",
+            "latestVersion": "v0.3.0",
+            "reason": "up-to-date-or-newer",
+            "releaseUrl": "https://example.invalid/v0.3.0",
+            "updateAvailable": False,
+        }
+        with mock.patch(
+            "release_client.prompt_update",
+            return_value=(no_update, None),
+        ) as prompt:
+            result = startup(
+                installed_path,
+                install_root,
+                "preview",
+                ["--json"],
+            )
+        self.assertEqual(result, 0)
+        prompt.assert_called_once_with(
+            REPOSITORY,
+            "preview",
+            install_root,
+            report_current=False,
+        )
 
     @staticmethod
     def _release(

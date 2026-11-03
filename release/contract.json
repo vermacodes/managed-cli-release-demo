@@ -18,7 +18,9 @@
     "README.md",
     "app/managed-demo.js",
     "app/managed-demo.ps1",
-    "app/managed-demo.sh"
+    "app/managed-demo.sh",
+    "scripts/release_client.py",
+    "scripts/release_tools.py"
   ],
   "maxArchiveBytes": 10485760,
   "maxEntryBytes": 1048576,
@@ -29,7 +31,9 @@
     "app/managed-demo.js",
     "app/managed-demo.ps1",
     "app/managed-demo.sh",
-    "release-info.json"
+    "release-info.json",
+    "scripts/release_client.py",
+    "scripts/release_tools.py"
   ],
   "schemaVersion": 1
 }

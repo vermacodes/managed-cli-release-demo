@@ -73,8 +73,9 @@ reports a development build. The packaged app reads the generated
 
 ## Download and install a published release
 
-Both wrappers call the same release client. GitHub CLI handles authentication;
-the scripts never read or persist a GitHub token.
+Both wrappers call the same release client. Public release discovery and
+downloads use GitHub's anonymous HTTPS APIs. GitHub CLI is used only to verify
+downloaded Sigstore bundles offline; no GitHub sign-in or token is required.
 
 ```bash
 ./scripts/get-release.sh \
@@ -89,10 +90,6 @@ the scripts never read or persist a GitHub token.
   -Tag v0.1.0 `
   -InstallRoot "$HOME\.managed-cli-demo"
 ```
-
-For private repositories, sign in first with `gh auth login`. Every install
-verifies all downloaded assets' attestations, manifest, and checksums against
-the release workflow, `main` source ref, and exact commit resolved from the tag.
 
 The client copies downloaded assets into a private staging directory before
 verification, installs under `versions/<release>`, verifies every installed
@@ -116,6 +113,16 @@ Versions use SemVer precedence rather than lexical ordering, and the updater
 never downgrades an installed version automatically. Automatic channel updates
 therefore require GitHub's repository-level immutable release policy.
 
+Installed PowerShell and Bash launchers check for updates before starting the
+app. The demo defaults to the `preview` channel; set
+`MANAGED_CLI_UPDATE_CHANNEL=stable` to follow stable releases. When a newer
+version exists, the launcher shows the exact version and release URL, then asks
+`Install this update now? [y/N]`. Blank, `n`, or any response other than
+`y`/`yes` keeps the current version. Non-interactive launches never update.
+
+Manual update commands use the same confirmation. Passing `--yes` in Bash or
+`-Yes` in PowerShell is explicit non-interactive approval.
+
 ```bash
 python3 scripts/release_client.py check-update \
   --repo vermacodes/managed-cli-release-demo \
@@ -126,6 +133,7 @@ python3 scripts/release_client.py check-update \
   --repo vermacodes/managed-cli-release-demo \
   --channel preview \
   --install-root "$HOME/.managed-cli-demo"
+# Add --yes only when intentionally approving an unattended update.
 ```
 
 ```powershell
@@ -133,6 +141,7 @@ python3 scripts/release_client.py check-update \
   -Repository vermacodes/managed-cli-release-demo `
   -Channel preview `
   -InstallRoot "$HOME\.managed-cli-demo"
+# Add -Yes only when intentionally approving an unattended update.
 ```
 
 Automatic updates always verify all three assets' provenance attestations,
