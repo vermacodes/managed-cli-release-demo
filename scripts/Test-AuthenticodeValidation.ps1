@@ -26,182 +26,74 @@ function Assert-Rejected {
     }
 }
 
-function Remove-TestCertificate {
-    param([Parameter(Mandatory = $true)][string]$Thumbprint)
-
-    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
-    foreach ($storeName in @('Root', 'My')) {
-        $store = $null
-        try {
-            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                $storeName,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-            )
-            $store.Open(
-                [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
-            )
-            $matches = $store.Certificates.Find(
-                [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-                $Thumbprint,
-                $false
-            )
-            foreach ($match in $matches) {
-                $store.Remove($match)
-            }
-        } catch {
-            $cleanupErrors.Add("$storeName`: $($_.Exception.Message)")
-        } finally {
-            if ($store) {
-                try {
-                    $store.Close()
-                } catch {
-                    $cleanupErrors.Add(
-                        "$storeName close: $($_.Exception.Message)"
-                    )
-                }
-            }
-        }
-    }
-    if ($cleanupErrors.Count -gt 0) {
-        throw "Certificate cleanup failed: $($cleanupErrors -join '; ')"
-    }
-}
-
 $temporaryRoot = Join-Path (
     [System.IO.Path]::GetTempPath()
 ) "managed-cli-authenticode-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 
-$subject = 'CN=Managed CLI Release Demo Test Publisher'
-$certificate = $null
-$rsa = $null
 try {
-    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
-    $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        [System.Security.Cryptography.X509Certificates.X500DistinguishedName]::new(
-            $subject
-        ),
-        $rsa,
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    $systemBinary = Join-Path $env:SystemRoot (
+        'System32\WindowsPowerShell\v1.0\powershell.exe'
     )
-    $codeSigningOids =
-        [System.Security.Cryptography.OidCollection]::new()
-    [void]$codeSigningOids.Add(
-        [System.Security.Cryptography.Oid]::new(
-            '1.3.6.1.5.5.7.3.3',
-            'Code Signing'
-        )
-    )
-    $request.CertificateExtensions.Add(
-        [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
-            $codeSigningOids,
-            $false
-        )
-    )
-    $request.CertificateExtensions.Add(
-        [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
-            [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature,
-            $true
-        )
-    )
-    $certificate = $request.CreateSelfSigned(
-        [DateTimeOffset]::UtcNow.AddMinutes(-5),
-        [DateTimeOffset]::UtcNow.AddDays(1)
-    )
-
-    $rootStore = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-        'Root',
-        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-    )
-    try {
-        $rootStore.Open(
-            [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
-        )
-        $rootStore.Add($certificate)
-    } finally {
-        $rootStore.Close()
-    }
-    $personalStore = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-        'My',
-        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-    )
-    try {
-        $personalStore.Open(
-            [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
-        )
-        $personalStore.Add($certificate)
-    } finally {
-        $personalStore.Close()
+    if (-not (Test-Path -LiteralPath $systemBinary -PathType Leaf)) {
+        throw "Trusted Windows signing fixture is missing: $systemBinary"
     }
 
-    $signedPath = Join-Path $temporaryRoot 'signed-demo.ps1'
+    $validPath = Join-Path $temporaryRoot 'valid-signed.exe'
+    $tamperedPath = Join-Path $temporaryRoot 'tampered-signed.exe'
     $unsignedPath = Join-Path $temporaryRoot 'unsigned-demo.ps1'
-    Set-Content -LiteralPath $signedPath -Value "Write-Output 'signed demo'"
+    Copy-Item -LiteralPath $systemBinary -Destination $validPath
+    Copy-Item -LiteralPath $systemBinary -Destination $tamperedPath
     Set-Content -LiteralPath $unsignedPath -Value "Write-Output 'unsigned demo'"
 
-    $signingResult = Set-AuthenticodeSignature `
-        -LiteralPath $signedPath `
-        -Certificate $certificate
-    if ($signingResult.Status -ne 'Valid') {
-        throw "Test signing failed: $($signingResult.Status)"
+    $knownGood = Get-AuthenticodeSignature -LiteralPath $validPath
+    if (
+        $knownGood.Status -ne
+        [System.Management.Automation.SignatureStatus]::Valid -or
+        -not $knownGood.SignerCertificate
+    ) {
+        throw "Windows signing fixture is not trusted: $($knownGood.Status)"
     }
+    $subject = $knownGood.SignerCertificate.Subject
+    $thumbprint = $knownGood.SignerCertificate.Thumbprint
 
     & (Join-Path $PSScriptRoot 'Assert-AuthenticodeSignature.ps1') `
-        -Path $signedPath `
+        -Path $validPath `
         -ExpectedSubject $subject `
-        -ExpectedThumbprint $certificate.Thumbprint | Out-Null
-    Write-Host 'Accepted valid signature and expected publisher.'
+        -ExpectedThumbprint $thumbprint | Out-Null
+    Write-Host 'Accepted valid signature, publisher, and thumbprint.'
 
     Assert-Rejected -Scenario 'wrong publisher' -Action {
         & (Join-Path $PSScriptRoot 'Assert-AuthenticodeSignature.ps1') `
-            -Path $signedPath `
+            -Path $validPath `
             -ExpectedSubject 'CN=Unexpected Publisher' `
-            -ExpectedThumbprint $certificate.Thumbprint
+            -ExpectedThumbprint $thumbprint
+    }
+    Assert-Rejected -Scenario 'wrong thumbprint' -Action {
+        & (Join-Path $PSScriptRoot 'Assert-AuthenticodeSignature.ps1') `
+            -Path $validPath `
+            -ExpectedSubject $subject `
+            -ExpectedThumbprint ('0' * $thumbprint.Length)
     }
     Assert-Rejected -Scenario 'unsigned file' -Action {
         & (Join-Path $PSScriptRoot 'Assert-AuthenticodeSignature.ps1') `
             -Path $unsignedPath `
             -ExpectedSubject $subject `
-            -ExpectedThumbprint $certificate.Thumbprint
+            -ExpectedThumbprint $thumbprint
     }
 
-    Add-Content -LiteralPath $signedPath -Value '# post-signing tamper'
+    $tamperedBytes = [System.IO.File]::ReadAllBytes($tamperedPath)
+    $tamperOffset = [Math]::Min(4096, $tamperedBytes.Length - 1)
+    $tamperedBytes[$tamperOffset] = $tamperedBytes[$tamperOffset] -bxor 1
+    [System.IO.File]::WriteAllBytes($tamperedPath, $tamperedBytes)
     Assert-Rejected -Scenario 'post-signing tamper' -Action {
         & (Join-Path $PSScriptRoot 'Assert-AuthenticodeSignature.ps1') `
-            -Path $signedPath `
+            -Path $tamperedPath `
             -ExpectedSubject $subject `
-            -ExpectedThumbprint $certificate.Thumbprint
+            -ExpectedThumbprint $thumbprint
     }
 
     Write-Host 'Authenticode validation tests passed.'
 } finally {
-    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
-    if ($certificate) {
-        try {
-            Remove-TestCertificate -Thumbprint $certificate.Thumbprint
-        } catch {
-            $cleanupErrors.Add($_.Exception.Message)
-        }
-        try {
-            $certificate.Dispose()
-        } catch {
-            $cleanupErrors.Add("Certificate dispose: $($_.Exception.Message)")
-        }
-    }
-    if ($rsa) {
-        try {
-            $rsa.Dispose()
-        } catch {
-            $cleanupErrors.Add("RSA dispose: $($_.Exception.Message)")
-        }
-    }
-    try {
-        Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop
-    } catch {
-        $cleanupErrors.Add("Temporary directory: $($_.Exception.Message)")
-    }
-    if ($cleanupErrors.Count -gt 0) {
-        throw "Authenticode test cleanup failed: $($cleanupErrors -join '; ')"
-    }
+    Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop
 }

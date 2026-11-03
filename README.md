@@ -155,18 +155,18 @@ Published release assets are cryptographically signed with GitHub's keyless
 OIDC/Sigstore provenance attestations. This is the actual trust mechanism used
 by the demo release client.
 
-The Windows CI job separately exercises Authenticode policy with an ephemeral,
-test-only certificate. It proves that the validator:
+The Windows CI job separately exercises Authenticode policy against a temporary
+copy of a trusted Microsoft-signed Windows system binary. It proves that the validator:
 
 - accepts a valid signature from the exact expected publisher and thumbprint;
 - rejects a wrong publisher;
+- rejects a wrong thumbprint;
 - rejects an unsigned file;
 - rejects bytes modified after signing.
 
-The test certificate is created and removed inside the CI job. It is not a
-production identity and never signs release assets. A production implementation
-must use its organization's approved code-signing service and publisher
-certificate.
+The fixture neither signs release assets nor modifies certificate stores. A
+production implementation must use its organization's approved code-signing
+service and publisher certificate.
 
 ## Workflows
 
