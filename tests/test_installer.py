@@ -40,6 +40,16 @@ class CommandInstallerTests(unittest.TestCase):
         )
         self.assertEqual(windows.bin_dir, windows.install_root / "bin")
 
+        installer_script = (
+            REPO_ROOT / "scripts" / "install-command.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("MINGW*", installer_script)
+        self.assertIn("py.exe -3 -B", installer_script)
+        self.assertIn(
+            'exec python3 -B "$script_dir/install_command.py"',
+            installer_script,
+        )
+
         linux = installer.default_layout(
             platform="linux",
             environment={},
