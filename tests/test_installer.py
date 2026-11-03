@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -154,6 +155,41 @@ class CommandInstallerTests(unittest.TestCase):
         self.assertIn("current.json", ps1)
         self.assertIn("managed-demo.ps1", ps1)
         self.assertIn("managed-cli-demo.ps1", cmd)
+
+
+    def test_windows_path_registration_uses_user_environment(self) -> None:
+        fake = types.SimpleNamespace(
+            HKEY_CURRENT_USER=object(),
+            REG_EXPAND_SZ=2,
+        )
+        key_context = mock.MagicMock()
+        key = key_context.__enter__.return_value
+        fake.CreateKey = mock.Mock(return_value=key_context)
+        fake.QueryValueEx = mock.Mock(
+            return_value=(r"C:\Existing", 2)
+        )
+        fake.SetValueEx = mock.Mock()
+        bin_dir = Path(r"C:\ManagedCliDemo\bin")
+        with (
+            mock.patch.dict(sys.modules, {"winreg": fake}),
+            mock.patch(
+                "install_command._broadcast_windows_environment_change"
+            ) as broadcast,
+        ):
+            result = installer._update_windows_path(bin_dir)
+        self.assertTrue(result.changed)
+        fake.CreateKey.assert_called_once_with(
+            fake.HKEY_CURRENT_USER,
+            "Environment",
+        )
+        fake.SetValueEx.assert_called_once_with(
+            key,
+            "Path",
+            0,
+            2,
+            rf"C:\Existing;{bin_dir}",
+        )
+        broadcast.assert_called_once_with()
 
     def test_install_registers_command_after_verified_install(self) -> None:
         layout = installer.InstallLayout(
